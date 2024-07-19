@@ -1,4 +1,27 @@
-use std::env;
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Decode bencoded value
+    Decode { value: String },
+}
+
+fn main() {
+    let args = Cli::parse();
+    match args.command {
+        Command::Decode { value } => {
+            let (decoded_value, _) = decode_bencoded_value(&value);
+            println!("{}", decoded_value);
+        }
+    }
+}
 
 fn decode_bencoded_value(encoded_value: &str) -> (serde_json::Value, &str) {
     match encoded_value.chars().next() {
@@ -29,18 +52,4 @@ fn decode_bencoded_value(encoded_value: &str) -> (serde_json::Value, &str) {
     }
 
     panic!("Unhandled encoded value: {}", encoded_value);
-}
-
-// Usage: your_bittorrent.sh decode "<encoded_value>"
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    let command = &args[1];
-
-    if command == "decode" {
-        let encoded_value = &args[2];
-        let decoded_value = decode_bencoded_value(encoded_value).0;
-        println!("{}", decoded_value);
-    } else {
-        println!("unknown command: {}", args[1])
-    }
 }
