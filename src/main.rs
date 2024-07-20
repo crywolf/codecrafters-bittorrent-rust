@@ -26,6 +26,7 @@ fn main() {
 fn decode_bencoded_value(encoded_value: &str) -> (serde_json::Value, &str) {
     match encoded_value.chars().next() {
         Some('0'..='9') => {
+            // <length>:<contents>
             // Example: "5:hello" -> "hello"
             if let Some((len, rest)) = encoded_value.split_once(':') {
                 if let Ok(len) = len.parse::<usize>() {
@@ -34,6 +35,7 @@ fn decode_bencoded_value(encoded_value: &str) -> (serde_json::Value, &str) {
             }
         }
         Some('i') => {
+            // i<number>e
             // Example: "i-42e" -> -42
             if let Some((n, rest)) =
                 encoded_value
@@ -49,6 +51,7 @@ fn decode_bencoded_value(encoded_value: &str) -> (serde_json::Value, &str) {
             }
         }
         Some('l') => {
+            // l<bencoded_elements>e
             // Example: l5:helloi52ee -> ["hello", 52] ; lli4eei5ee -> [[4],5]
             let mut rest = encoded_value.split_at(1).1;
             let mut list = Vec::new();
@@ -58,6 +61,23 @@ fn decode_bencoded_value(encoded_value: &str) -> (serde_json::Value, &str) {
                 rest = remainder;
             }
             return (list.into(), &rest[1..]);
+        }
+        Some('d') => {
+            // d<key1><value1>...<keyN><valueN>e. The keys are sorted in lexicographical order and must be strings.
+            // Example: d3:foo3:bar5:helloi52ee -> {"hello": 52, "foo":"bar"}
+            let mut rest = encoded_value.split_at(1).1;
+            let mut dictionary = serde_json::Map::new();
+            while !rest.starts_with('e') && !rest.is_empty() {
+                let (key, remainder) = decode_bencoded_value(rest);
+                let (val, remainder) = decode_bencoded_value(remainder);
+                let key = match key {
+                    serde_json::Value::String(key) => key,
+                    key => panic!("Key must be a string, but is {:?}", key),
+                };
+                dictionary.insert(key, val);
+                rest = remainder;
+            }
+            return (dictionary.into(), &rest[1..]);
         }
         _ => {}
     }
