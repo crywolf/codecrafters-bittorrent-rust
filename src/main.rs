@@ -48,6 +48,17 @@ fn decode_bencoded_value(encoded_value: &str) -> (serde_json::Value, &str) {
                 return (n.into(), rest);
             }
         }
+        Some('l') => {
+            // Example: l5:helloi52ee -> ["hello", 52] ; lli4eei5ee -> [[4],5]
+            let mut rest = encoded_value.split_at(1).1;
+            let mut list = Vec::new();
+            while !rest.starts_with('e') && !rest.is_empty() {
+                let (value, remainder) = decode_bencoded_value(rest);
+                list.push(value);
+                rest = remainder;
+            }
+            return (list.into(), &rest[1..]);
+        }
         _ => {}
     }
 
