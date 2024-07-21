@@ -1,5 +1,6 @@
 use anyhow::Context;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha1::Digest;
 use std::{fs, path::PathBuf};
 
 /// Metainfo files (also known as .torrent files) are bencoded dictionaries
@@ -13,7 +14,7 @@ pub struct Torrent {
     pub info: Info,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct Info {
     /// size of the file in bytes, for single-file torrents
     pub length: usize,
@@ -29,6 +30,9 @@ pub struct Info {
     // concatenated SHA-1 hashes of each piece
     #[serde(with = "serde_bytes")]
     pub pieces: Vec<u8>,
+    /// SHA-1 hash of this bencoded Info dictionary
+    #[serde(skip)]
+    pub hash: String,
 }
 
 pub fn parse_torrent(file: PathBuf) -> anyhow::Result<Torrent> {
@@ -37,6 +41,11 @@ pub fn parse_torrent(file: PathBuf) -> anyhow::Result<Torrent> {
     let torrent: Torrent =
         serde_bencode::from_bytes(&bytes).context("deserializing torrent data")?;
 
+    let info_bencoded =
+        serde_bencode::to_bytes(&torrent.info).context("bencoding Info dictionary")?;
+
+    let digest = sha1::Sha1::digest(info_bencoded);
+
     Ok(Torrent {
         announce: torrent.announce,
         info: Info {
@@ -44,6 +53,7 @@ pub fn parse_torrent(file: PathBuf) -> anyhow::Result<Torrent> {
             name: torrent.info.name,
             piece_length: torrent.info.piece_length,
             pieces: torrent.info.pieces,
+            hash: hex::encode(digest),
         },
     })
 }

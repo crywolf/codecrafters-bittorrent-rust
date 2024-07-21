@@ -22,7 +22,7 @@ edition = "2021"
 anyhow = "1.0.86"                                                  # error handling
 bytes = "1.6.1"                                                    # helps wrap responses from reqwest
 clap = { version = "4.5.9", features = ["derive"]}                # creating a cli
-#hex = "0.4.3"
+hex = "0.4.3"
 regex = "1"                                                        # for regular expressions
 reqwest = { version = "0.12.5", features = ["json", "blocking"] } # http requests
 serde = { version = "1.0.136", features = ["derive"] }             # for json mangling

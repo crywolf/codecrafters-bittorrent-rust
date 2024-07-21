@@ -32,6 +32,7 @@ fn main() -> anyhow::Result<()> {
             let torrent = torrent::parse_torrent(file).context("parsing torrent file")?;
             println!("Tracker URL: {}", torrent.announce);
             println!("Length: {}", torrent.info.length);
+            println!("Info Hash: {}", torrent.info.hash);
             Ok(())
         }
     }
