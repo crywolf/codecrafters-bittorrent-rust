@@ -1,3 +1,4 @@
+mod peers;
 mod torrent;
 
 use std::path::PathBuf;
@@ -18,9 +19,12 @@ enum Command {
     Decode { value: String },
     /// Print torrent info
     Info { file: PathBuf },
+    /// Print peers to download the file from
+    Peers { file: PathBuf },
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
     match args.command {
         Command::Decode { value } => {
@@ -32,11 +36,20 @@ fn main() -> anyhow::Result<()> {
             let torrent = torrent::parse_torrent(file).context("parsing torrent file")?;
             println!("Tracker URL: {}", torrent.announce);
             println!("Length: {}", torrent.info.length);
-            println!("Info Hash: {}", torrent.info.hash);
+            println!("Info Hash: {}", hex::encode(torrent.info.hash));
             println!("Piece Length: {}", torrent.info.piece_length);
             println!("Info Hashes: ");
             for hash in torrent.info.pieces.chunks_exact(20) {
                 println!("{}", hex::encode(hash));
+            }
+            Ok(())
+        }
+        Command::Peers { file } => {
+            let tracker_response = peers::discover_peers(file)
+                .await
+                .context("discovering peers")?;
+            for peer in tracker_response.peers.adresses() {
+                println!("{}", peer);
             }
             Ok(())
         }

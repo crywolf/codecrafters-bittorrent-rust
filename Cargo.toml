@@ -33,4 +33,4 @@ serde_urlencoded = "0.7.1"                                         # for url enc
 sha1 = "0.10.6"                                                    # hashing
 #tempfile = "3"                                                     # creating temporary directories
 #thiserror = "1.0.38"                                               # error handling
-#tokio = { version = "1.38.1", features = ["full"] }                # async http requests
+tokio = { version = "1.38.1", features = ["full"] }                # async http requests

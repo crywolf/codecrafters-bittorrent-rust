@@ -32,7 +32,7 @@ pub struct Info {
     pub pieces: Vec<u8>,
     /// SHA-1 hash of this bencoded Info dictionary
     #[serde(skip)]
-    pub hash: String,
+    pub hash: [u8; 20],
 }
 
 pub fn parse_torrent(file: PathBuf) -> anyhow::Result<Torrent> {
@@ -53,7 +53,7 @@ pub fn parse_torrent(file: PathBuf) -> anyhow::Result<Torrent> {
             name: torrent.info.name,
             piece_length: torrent.info.piece_length,
             pieces: torrent.info.pieces,
-            hash: hex::encode(digest),
+            hash: digest.into(),
         },
     })
 }
