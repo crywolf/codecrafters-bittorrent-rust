@@ -11,6 +11,8 @@ Protocol, pipelining and more.
 **Note**: If you're viewing this repo on GitHub, head over to
 [codecrafters.io](https://codecrafters.io) to try the challenge.
 
+[The BitTorrent Protocol Specification](https://www.bittorrent.org/beps/bep_0003.html)
+
 # Passing the first stage
 
 The entry point for your BitTorrent implementation is in `src/main.rs`. Study
