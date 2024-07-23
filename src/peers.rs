@@ -2,10 +2,13 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::Path;
 
 use anyhow::Context;
-use bytes::Buf;
+use bytes::{Buf, BufMut};
 use serde::{Deserialize, Deserializer, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::torrent;
+
+const PEER_ID: &str = "00112233445566778899";
 
 #[derive(Deserialize)]
 pub struct TrackerResponse {
@@ -44,7 +47,7 @@ pub async fn discover_peers(file: impl AsRef<Path>) -> anyhow::Result<TrackerRes
     let torrent = torrent::parse_torrent(file.as_ref().into()).context("parsing torrent file")?;
 
     let request = TrackerRequest {
-        peer_id: String::from("00112233445566778899"),
+        peer_id: String::from(PEER_ID),
         port: 6881,
         uploaded: 0,
         downloaded: 0,
@@ -72,6 +75,55 @@ pub async fn discover_peers(file: impl AsRef<Path>) -> anyhow::Result<TrackerRes
         serde_bencode::from_bytes(&response).context("deserializing tracker response")?;
 
     Ok(tracker_response)
+}
+
+pub async fn handshake(file: impl AsRef<Path>, peer_socket: String) -> anyhow::Result<[u8; 20]> {
+    let torrent = torrent::parse_torrent(file.as_ref().into()).context("parsing torrent file")?;
+
+    let peer_socket = peer_socket
+        .parse::<SocketAddrV4>()
+        .context("parsing peer address")?;
+
+    let mut stream = tokio::net::TcpStream::connect(peer_socket)
+        .await
+        .context("connecting to peer")?;
+
+    /*
+       The handshake is a message consisting of the following parts as described in the peer protocol:
+
+       * length of the protocol string (BitTorrent protocol) which is 19 (1 byte)
+       * the string BitTorrent protocol (19 bytes)
+       * eight reserved bytes, which are all set to zero (8 bytes)
+       * sha1 infohash (20 bytes) (NOT the hexadecimal representation, which is 40 bytes long)
+       * peer id (20 bytes) (you can use 00112233445566778899 for this challenge)
+    */
+    let handshake_len = 68;
+    let mut data = bytes::BytesMut::with_capacity(handshake_len);
+    data.put_u8(19);
+    data.put_slice(b"BitTorrent protocol");
+    data.put_bytes(b'0', 8);
+    data.put_slice(&torrent.info.hash);
+    data.put_slice(PEER_ID.as_bytes());
+
+    stream
+        .write_all(&data)
+        .await
+        .context("sending handshake data to peer")?;
+
+    let mut resp = Vec::with_capacity(handshake_len);
+    resp.reserve_exact(handshake_len);
+    resp.put_bytes(b'0', handshake_len);
+    stream
+        .read_exact(&mut resp)
+        .await
+        .context("reading handshake response")?;
+    anyhow::ensure!(resp[0] == 19);
+    anyhow::ensure!(&resp[1..20] == b"BitTorrent protocol");
+
+    let mut remote_peer_id = [0_u8; 20];
+    remote_peer_id.copy_from_slice(&resp[handshake_len - 20..]);
+
+    Ok(remote_peer_id)
 }
 
 fn urlencode(t: &[u8; 20]) -> String {

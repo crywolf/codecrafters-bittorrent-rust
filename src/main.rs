@@ -21,6 +21,8 @@ enum Command {
     Info { file: PathBuf },
     /// Print peers to download the file from
     Peers { file: PathBuf },
+    /// Establish a TCP connection with a peer and complete a handshak
+    Handshake { file: PathBuf, peer_socket: String },
 }
 
 #[tokio::main]
@@ -51,6 +53,17 @@ async fn main() -> anyhow::Result<()> {
             for peer in tracker_response.peers.adresses() {
                 println!("{}", peer);
             }
+            Ok(())
+        }
+        Command::Handshake { file, peer_socket } => {
+            // TODO
+            // let torrent = torrent::parse_torrent(file).context("parsing torrent file")?;
+            // let info_hash = torrent.info.hash;
+            // println!("Info Hash: {}", hex::encode(info_hash));
+            //println!("peer: {}", peer_socket);
+
+            let remote_peer_id = peers::handshake(file, peer_socket).await?;
+            println!("Peer ID: {}", hex::encode(remote_peer_id));
             Ok(())
         }
     }
