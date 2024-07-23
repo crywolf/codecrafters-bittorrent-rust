@@ -1,4 +1,4 @@
-mod peers;
+mod peer;
 mod torrent;
 
 use std::path::PathBuf;
@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Peers { file } => {
-            let tracker_response = peers::discover_peers(file)
+            let tracker_response = peer::discover_peers(file)
                 .await
                 .context("discovering peers")?;
             for peer in tracker_response.peers.adresses() {
@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
             // println!("Info Hash: {}", hex::encode(info_hash));
             //println!("peer: {}", peer_socket);
 
-            let remote_peer_id = peers::handshake(file, peer_socket).await?;
+            let remote_peer_id = peer::handshake(file, peer_socket).await?;
             println!("Peer ID: {}", hex::encode(remote_peer_id));
             Ok(())
         }
