@@ -56,12 +56,6 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Handshake { file, peer_socket } => {
-            // TODO
-            // let torrent = torrent::parse_torrent(file).context("parsing torrent file")?;
-            // let info_hash = torrent.info.hash;
-            // println!("Info Hash: {}", hex::encode(info_hash));
-            //println!("peer: {}", peer_socket);
-
             let remote_peer_id = peer::handshake(file, peer_socket).await?;
             println!("Peer ID: {}", hex::encode(remote_peer_id));
             Ok(())
