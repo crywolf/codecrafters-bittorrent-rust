@@ -117,6 +117,7 @@ pub async fn handshake(file: impl AsRef<Path>, peer_socket: String) -> anyhow::R
         .read_exact(&mut resp)
         .await
         .context("reading handshake response")?;
+    anyhow::ensure!(resp.len() == handshake_len);
     anyhow::ensure!(resp[0] == 19);
     anyhow::ensure!(&resp[1..20] == b"BitTorrent protocol");
 
