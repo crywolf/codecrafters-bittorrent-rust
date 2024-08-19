@@ -14,6 +14,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[clap(rename_all = "snake_case")]
 enum Command {
     /// Decode bencoded value
     Decode { value: String },
@@ -21,8 +22,18 @@ enum Command {
     Info { file: PathBuf },
     /// Print peers to download the file from
     Peers { file: PathBuf },
-    /// Establish a TCP connection with a peer and complete a handshak
+    /// Establish a TCP connection with a peer and complete a handshake
     Handshake { file: PathBuf, peer_socket: String },
+    /// Download one piece and save it to disk
+    DownloadPiece {
+        /// Output file
+        #[arg(short)]
+        output: PathBuf,
+        /// Torrent file
+        torrent: PathBuf,
+        /// Piece number
+        piece: usize,
+    },
 }
 
 #[tokio::main]
@@ -38,10 +49,10 @@ async fn main() -> anyhow::Result<()> {
             let torrent = torrent::parse_torrent(file).context("parsing torrent file")?;
             println!("Tracker URL: {}", torrent.announce);
             println!("Length: {}", torrent.info.length);
-            println!("Info Hash: {}", hex::encode(torrent.info.hash));
+            println!("Info Hash: {}", hex::encode(torrent.info.info_hash));
             println!("Piece Length: {}", torrent.info.piece_length);
             println!("Info Hashes: ");
-            for hash in torrent.info.pieces.chunks_exact(20) {
+            for hash in torrent.info.hashes.iter() {
                 println!("{}", hex::encode(hash));
             }
             Ok(())
@@ -50,14 +61,23 @@ async fn main() -> anyhow::Result<()> {
             let tracker_response = peer::discover_peers(file)
                 .await
                 .context("discovering peers")?;
-            for peer in tracker_response.peers.adresses() {
+            for &peer in tracker_response.peers.iter() {
                 println!("{}", peer);
             }
             Ok(())
         }
         Command::Handshake { file, peer_socket } => {
-            let remote_peer_id = peer::handshake(file, peer_socket).await?;
+            let (remote_peer_id, _) = peer::handshake(file, peer_socket).await?;
             println!("Peer ID: {}", hex::encode(remote_peer_id));
+            Ok(())
+        }
+        Command::DownloadPiece {
+            output,
+            torrent,
+            piece,
+        } => {
+            peer::download_piece(&output, torrent, piece).await?;
+            println!("Piece {} downloaded to {}.", piece, output.display());
             Ok(())
         }
     }

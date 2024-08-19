@@ -1,8 +1,13 @@
+mod codec;
+mod download;
+
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::ops::Deref;
 use std::path::Path;
 
 use anyhow::Context;
 use bytes::{Buf, BufMut};
+
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -12,17 +17,20 @@ const PEER_ID: &str = "00112233445566778899";
 
 #[derive(Deserialize)]
 pub struct TrackerResponse {
-    /// An integer, indicating how often the client should make a request to the tracker. Ignored in this challenge.
+    /// An integer, indicating how often (in seconds) the client should make a request to the tracker. Ignored in this challenge.
     pub interval: u64,
-    /// A string, which contains list of peers that your client can connect to.
-    /// Each peer is represented using 6 bytes. The first 4 bytes are the peer's IP address and the last 2 bytes are the peer's port number.
+    /// List of peers that the client can connect to.
     pub peers: Peers,
 }
 
-pub struct Peers(pub Vec<SocketAddrV4>);
+/// Deserialized from a string, which contains list of peers that the client can connect to.
+/// Each peer is represented using 6 bytes. The first 4 bytes are the peer's IP address and the last 2 bytes are the peer's port number.
+pub struct Peers(Vec<SocketAddrV4>);
 
-impl Peers {
-    pub fn adresses(&self) -> &[SocketAddrV4] {
+impl Deref for Peers {
+    type Target = [SocketAddrV4];
+
+    fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
@@ -56,7 +64,7 @@ pub async fn discover_peers(file: impl AsRef<Path>) -> anyhow::Result<TrackerRes
     };
 
     let query = serde_urlencoded::to_string(request).context("serializing request query params")?;
-    let info_hash = torrent.info.hash;
+    let info_hash = torrent.info.info_hash;
     let url = format!(
         "{}?{}&info_hash={}",
         torrent.announce,
@@ -77,7 +85,10 @@ pub async fn discover_peers(file: impl AsRef<Path>) -> anyhow::Result<TrackerRes
     Ok(tracker_response)
 }
 
-pub async fn handshake(file: impl AsRef<Path>, peer_socket: String) -> anyhow::Result<[u8; 20]> {
+pub async fn handshake(
+    file: impl AsRef<Path>,
+    peer_socket: String,
+) -> anyhow::Result<([u8; 20], tokio::net::TcpStream)> {
     let torrent = torrent::parse_torrent(file.as_ref().into()).context("parsing torrent file")?;
 
     let peer_socket = peer_socket
@@ -97,12 +108,12 @@ pub async fn handshake(file: impl AsRef<Path>, peer_socket: String) -> anyhow::R
        * sha1 infohash (20 bytes) (NOT the hexadecimal representation, which is 40 bytes long)
        * peer id (20 bytes) (you can use 00112233445566778899 for this challenge)
     */
-    let handshake_len = 68;
+    let handshake_len = 1 + 19 + 8 + 20 + 20;
     let mut data = bytes::BytesMut::with_capacity(handshake_len);
     data.put_u8(19);
     data.put_slice(b"BitTorrent protocol");
     data.put_bytes(b'0', 8);
-    data.put_slice(&torrent.info.hash);
+    data.put_slice(&torrent.info.info_hash);
     data.put_slice(PEER_ID.as_bytes());
 
     stream
@@ -124,7 +135,7 @@ pub async fn handshake(file: impl AsRef<Path>, peer_socket: String) -> anyhow::R
     let mut remote_peer_id = [0_u8; 20];
     remote_peer_id.copy_from_slice(&resp[handshake_len - 20..]);
 
-    Ok(remote_peer_id)
+    Ok((remote_peer_id, stream))
 }
 
 fn urlencode(t: &[u8; 20]) -> String {
@@ -134,6 +145,46 @@ fn urlencode(t: &[u8; 20]) -> String {
         encoded.push_str(&hex::encode([byte]));
     }
     encoded
+}
+
+pub async fn download_piece(
+    output: impl AsRef<Path>,
+    torrent: impl AsRef<Path>,
+    piece: usize,
+) -> anyhow::Result<()> {
+    let peers = discover_peers(torrent.as_ref())
+        .await
+        .context("discovering peers")?
+        .peers;
+
+    if peers.is_empty() {
+        anyhow::bail!("no peers available")
+    }
+
+    let mut stream: Option<tokio::net::TcpStream> = None;
+    for &peer in peers.iter() {
+        stream = match handshake(torrent.as_ref(), peer.to_string()).await {
+            Ok((_, s)) => Some(s),
+            Err(err) => {
+                eprintln!("Rerforming hanshake with peer {peer} failed with error: {err:?}");
+                None
+            }
+        };
+
+        if stream.is_some() {
+            eprintln!("succesfull handhake with peer: {peer}");
+            break;
+        }
+    }
+
+    if let Some(stream) = stream {
+        let torrent =
+            torrent::parse_torrent(torrent.as_ref().into()).context("parsing torrent file")?;
+
+        download::download_piece(stream, output, piece, &torrent).await
+    } else {
+        anyhow::bail!("failed to connect to any peer")
+    }
 }
 
 use std::fmt;
@@ -159,7 +210,7 @@ impl<'de> Visitor<'de> for PeersVisitor {
 
         let mut socket_addrs = Vec::new();
 
-        for bytes in value.chunks(6) {
+        for bytes in value.chunks_exact(6) {
             let ip = &bytes[..4];
             let mut port = &bytes[4..];
             let ip_addr = Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]);
