@@ -112,7 +112,7 @@ pub async fn handshake(
     let mut data = bytes::BytesMut::with_capacity(handshake_len);
     data.put_u8(19);
     data.put_slice(b"BitTorrent protocol");
-    data.put_bytes(b'0', 8);
+    data.put_bytes(b'\0', 8);
     data.put_slice(&torrent.info.info_hash);
     data.put_slice(PEER_ID.as_bytes());
 
@@ -128,6 +128,7 @@ pub async fn handshake(
         .read_exact(&mut resp)
         .await
         .context("reading handshake response")?;
+
     anyhow::ensure!(resp.len() == handshake_len);
     anyhow::ensure!(resp[0] == 19);
     anyhow::ensure!(&resp[1..20] == b"BitTorrent protocol");
