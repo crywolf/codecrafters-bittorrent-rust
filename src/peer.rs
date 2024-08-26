@@ -2,6 +2,7 @@ mod codec;
 mod download;
 mod framer;
 
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::ops::Deref;
 use std::path::Path;
@@ -11,6 +12,7 @@ use bytes::{Buf, BufMut};
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::piece::Piece;
 use crate::torrent;
 use framer::Framer;
 
@@ -222,29 +224,87 @@ pub async fn download_all(
         torrent::parse_torrent(torrent.as_ref().into()).context("parsing torrent file")?;
     let pieces_count = torrent.info.hashes.len();
 
-    let mut piece_files = Vec::new();
+    // we need MPMC channel for the task queue
+    let (needed_pieces, tasks) = kanal::bounded_async::<Piece>(pieces_count);
+    let errored_pieces = needed_pieces.clone();
 
-    // TODO download from more peers
-    let peer_stream = peer_streams
-        .pop()
-        .expect("we are connected to at least one peer");
+    tokio::spawn(async move {
+        // send all pieces to the queue
+        for piece_index in 0..pieces_count {
+            let tmp_file =
+                tempfile::NamedTempFile::new().expect("creating tmp file should proceed");
+            let tmp_file_path = tmp_file.into_temp_path().to_path_buf();
+            let piece = Piece {
+                index: piece_index,
+                file_path: tmp_file_path.clone(),
+            };
 
-    let mut framer = Framer::new(peer_stream).await?;
+            needed_pieces
+                .send(piece)
+                .await
+                .expect("tasks should not be closed");
+        }
+    });
 
-    for piece in 0..pieces_count {
-        let tmp_file = tempfile::NamedTempFile::new()?;
-        let tmp_file_path = tmp_file.into_temp_path().to_path_buf();
-        piece_files.push(tmp_file_path.clone());
+    let (pieces_tx, mut downloaded_pieces) = tokio::sync::mpsc::channel::<Piece>(1);
 
-        eprintln!("---> downloading piece {}", piece);
-        framer = download::download_piece(framer, tmp_file_path, piece, &torrent).await?;
-        eprintln!("<--- piece {} downloaded", piece);
+    // every peer connection will take a piece to download from the queue
+    for peer_stream in peer_streams {
+        let mut framer = Framer::new(peer_stream).await?;
+
+        let tasks = tasks.clone();
+        let pieces_tx = pieces_tx.clone();
+        let errored_pieces = errored_pieces.clone();
+        let torrent = torrent.clone();
+
+        tokio::spawn(async move {
+            while let Ok(piece) = tasks.recv().await {
+                let piece_index = piece.index;
+                eprintln!("---> downloading piece {}", piece_index);
+                match download::download_piece(
+                    framer,
+                    piece.file_path.clone(),
+                    piece.index,
+                    &torrent,
+                )
+                .await
+                {
+                    Ok(f) => {
+                        framer = f;
+                        pieces_tx
+                            .send(piece)
+                            .await
+                            .expect("pieces receiver should not be closed");
+                    }
+
+                    Err(err) => {
+                        eprintln!("{:?}, returning piece {} to the queue", err, piece_index);
+                        errored_pieces
+                            .send(piece)
+                            .await
+                            .expect("needed pieces queue shoud not be closed");
+                        break; // TODO reconnect to the failed peer or some new peer
+                    }
+                }
+                eprintln!("<--- piece {} downloaded", piece_index);
+            }
+        });
+    }
+
+    let mut piece_files = BTreeMap::new();
+
+    while let Some(piece) = downloaded_pieces.recv().await {
+        eprintln!("<<< received piece {}", piece.index);
+        piece_files.insert(piece.index, piece.file_path);
+        if piece_files.len() == pieces_count {
+            break;
+        }
     }
 
     let mut output_file = tokio::fs::File::create(&output).await?;
 
-    for piece_file_name in piece_files {
-        let mut piece_file = tokio::fs::File::open(piece_file_name).await?;
+    for (_, file_name) in piece_files {
+        let mut piece_file = tokio::fs::File::open(file_name).await?;
         tokio::io::copy(&mut piece_file, &mut output_file)
             .await
             .with_context(|| format!("writing piece data do file {}", output.as_ref().display()))?;

@@ -5,7 +5,7 @@ use std::{fs, ops::Deref, path::PathBuf};
 
 /// Metainfo files (also known as .torrent files) are bencoded dictionaries
 /// https://www.bittorrent.org/beps/bep_0003.html#metainfo-files
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Torrent {
     /// The URL of the tracker, which is a central server
     /// that keeps track of peers participating in the sharing of a torrent
@@ -15,7 +15,7 @@ pub struct Torrent {
     pub info: Info,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Info {
     /// size of the file in bytes, for single-file torrents
     pub length: usize,
@@ -45,7 +45,7 @@ pub struct Info {
     pub info_hash: [u8; 20],
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Hashes(Vec<[u8; 20]>);
 
 impl Deref for Hashes {

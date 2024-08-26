@@ -1,4 +1,5 @@
 mod peer;
+mod piece;
 mod torrent;
 
 use std::{net::SocketAddrV4, path::PathBuf};

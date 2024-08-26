@@ -88,7 +88,7 @@ pub async fn download_piece(
                     _ = framer
                         .send(message)
                         .await
-                        .context("sending Request message") .map_err(|e| eprintln!("Error: {:?}", e));
+                        .context("sending Request message").map_err(|e| eprintln!("Error: {:?}", e));
                 }
 
                 // 5. Wait for a Piece message for each block you've requested
