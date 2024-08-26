@@ -1,7 +1,7 @@
 mod peer;
 mod torrent;
 
-use std::path::PathBuf;
+use std::{net::SocketAddrV4, path::PathBuf};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -33,6 +33,14 @@ enum Command {
         torrent: PathBuf,
         /// Piece number
         piece: usize,
+    },
+    /// Download the whole file and save it to disk
+    Download {
+        /// Output file
+        #[arg(short)]
+        output: PathBuf,
+        /// Torrent file
+        torrent: PathBuf,
     },
 }
 
@@ -67,6 +75,10 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Handshake { file, peer_socket } => {
+            let peer_socket = peer_socket
+                .parse::<SocketAddrV4>()
+                .context("parsing peer address")?;
+
             let (remote_peer_id, _) = peer::handshake(file, peer_socket).await?;
             println!("Peer ID: {}", hex::encode(remote_peer_id));
             Ok(())
@@ -78,6 +90,11 @@ async fn main() -> anyhow::Result<()> {
         } => {
             peer::download_piece(&output, torrent, piece).await?;
             println!("Piece {} downloaded to {}.", piece, output.display());
+            Ok(())
+        }
+        Command::Download { output, torrent } => {
+            peer::download_all(&output, &torrent).await?;
+            println!("Downloaded {} to {}.", torrent.display(), output.display());
             Ok(())
         }
     }

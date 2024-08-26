@@ -1,9 +1,9 @@
 use bytes::{Buf, BufMut, BytesMut};
-use tokio_util::codec::Decoder;
-use tokio_util::codec::Encoder;
+use tokio_util::codec::{Decoder, Encoder};
 
-use super::download::{Message, MessageTag};
+use super::framer::{Message, MessageTag};
 
+#[derive(Debug)]
 pub struct MessageCodec;
 
 const MAX: usize = (1 << 14) + 1000; // 2^14 (16 kiB) + some reserve

@@ -2,12 +2,10 @@ use std::path::Path;
 
 use anyhow::Context;
 use bytes::{Buf, BufMut};
-use futures_util::SinkExt;
-use futures_util::StreamExt;
-use num_enum::{IntoPrimitive, TryFromPrimitive};
+use futures_util::{SinkExt, StreamExt};
 use sha1::Digest;
 
-use crate::peer::codec::MessageCodec;
+use super::framer::{Framer, Message, MessageTag};
 use crate::torrent::Torrent;
 
 const BLOCK_MAX_SIZE: usize = 1 << 14; // 2^14 (16 kiB)
@@ -17,67 +15,17 @@ const BLOCK_MAX_SIZE: usize = 1 << 14; // 2^14 (16 kiB)
 // to avoid a delay between blocks being sent.
 const PIPELINED_REQUESTS: usize = 5;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoPrimitive, TryFromPrimitive)]
-#[repr(u8)]
-pub enum MessageTag {
-    Choke = 0,
-    Unchoke = 1,
-    Interested = 2,
-    NotInterested = 3,
-    Have = 4,
-    Bitfield = 5,
-    Request = 6,
-    Piece = 7,
-    Cancel = 8,
-}
-
-#[derive(Debug)]
-pub struct Message {
-    pub tag: MessageTag,
-    pub payload: Vec<u8>,
-}
-
 pub async fn download_piece(
-    stream: tokio::net::TcpStream,
+    mut framer: Framer,
     output: impl AsRef<Path>,
     piece: usize,
     torrent: &Torrent,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Framer> {
     let pieces_count = torrent.info.hashes.len();
 
     if piece > pieces_count {
         anyhow::bail!("piece argument out of range, max value is {}", pieces_count)
     }
-
-    let mut framer = tokio_util::codec::Framed::new(stream, MessageCodec);
-
-    // 1. Wait for a Bitfield message from the peer indicating which pieces it has
-    let bitfield_msg = framer
-        .next()
-        .await
-        .expect("expecting Bitfield message")
-        .context("decoding Bitfield message")?;
-
-    anyhow::ensure!(bitfield_msg.tag == MessageTag::Bitfield, "Bitfield message");
-    // ignore the payload for now, the tracker used for this challenge ensures that all peers have all pieces available
-
-    // 2. Send an Interested message
-    framer
-        .send(Message {
-            tag: MessageTag::Interested,
-            payload: Vec::new(),
-        })
-        .await
-        .context("sending Interested message")?;
-
-    // 3. Wait until you receive an Unchoke message back
-    let unchoke_msg = framer
-        .next()
-        .await
-        .expect("expecting Unchoke message")
-        .context("decoding Unchoke message")?;
-
-    anyhow::ensure!(unchoke_msg.tag == MessageTag::Unchoke, "Unchoke message");
 
     let file_len = torrent.info.length;
 
@@ -129,8 +77,10 @@ pub async fn download_piece(
     });
 
     let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<Message>(1);
+    let (framer_tx, framer_rx) = tokio::sync::oneshot::channel::<Framer>();
 
     tokio::spawn(async move {
+        let mut received_blocks = 0;
         loop {
             tokio::select! {
                 // 4. Send a Request message for each block
@@ -139,19 +89,35 @@ pub async fn download_piece(
                         .send(message)
                         .await
                         .context("sending Request message") .map_err(|e| eprintln!("Error: {:?}", e));
-                    }
+                }
 
                 // 5. Wait for a Piece message for each block you've requested
-                Some(Ok(message)) = framer.next() => {
-                    if message.tag == MessageTag::Piece { // ignoring other message types
-                        response_tx
-                        .send(message)
-                        .await
-                        .expect("receiver should not be closed")
+                Some(resp) = framer.next() => {
+                    if let Ok(message) = resp {
+                        if message.tag == MessageTag::Piece { // ignoring other message types
+                            response_tx
+                            .send(message)
+                            .await
+                            .expect("receiver should not be closed");
+
+                            received_blocks += 1;
+
+                            if received_blocks == blocks_count { break; }
+                        }
+                    } else {
+                        eprintln!("Error: {:?}", resp.context("reading Piece message"));
+                        break;
                     }
                 }
+
+                else => { break; }
             }
         }
+
+        // ending request/response loop, returning framer
+        framer_tx
+            .send(framer)
+            .expect("receiver should not be closed");
     });
 
     let mut piece_buf: Vec<Vec<u8>> = Vec::with_capacity(blocks_count);
@@ -177,6 +143,7 @@ pub async fn download_piece(
             .put(block_data);
 
         received_blocks += 1;
+
         if received_blocks == blocks_count {
             break;
         }
@@ -197,8 +164,11 @@ pub async fn download_piece(
         "piece hash of downloaded data does not match the hash from the torrent file"
     );
 
-    std::fs::write(&output, piece_data)
+    tokio::fs::write(&output, piece_data)
+        .await
         .with_context(|| format!("writing piece data do file {}", output.as_ref().display()))?;
 
-    Ok(())
+    let framer = framer_rx.await?;
+
+    Ok(framer)
 }

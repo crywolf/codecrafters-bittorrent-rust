@@ -1,5 +1,6 @@
 mod codec;
 mod download;
+mod framer;
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::ops::Deref;
@@ -7,13 +8,14 @@ use std::path::Path;
 
 use anyhow::Context;
 use bytes::{Buf, BufMut};
-
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::torrent;
+use framer::Framer;
 
 const PEER_ID: &str = "00112233445566778899";
+const MAX_CONNECTED_PEERS: usize = 5;
 
 #[derive(Deserialize)]
 pub struct TrackerResponse {
@@ -87,13 +89,9 @@ pub async fn discover_peers(file: impl AsRef<Path>) -> anyhow::Result<TrackerRes
 
 pub async fn handshake(
     file: impl AsRef<Path>,
-    peer_socket: String,
+    peer_socket: SocketAddrV4,
 ) -> anyhow::Result<([u8; 20], tokio::net::TcpStream)> {
     let torrent = torrent::parse_torrent(file.as_ref().into()).context("parsing torrent file")?;
-
-    let peer_socket = peer_socket
-        .parse::<SocketAddrV4>()
-        .context("parsing peer address")?;
 
     let mut stream = tokio::net::TcpStream::connect(peer_socket)
         .await
@@ -164,16 +162,16 @@ pub async fn download_piece(
 
     let mut stream: Option<tokio::net::TcpStream> = None;
     for &peer in peers.iter() {
-        stream = match handshake(torrent.as_ref(), peer.to_string()).await {
+        stream = match handshake(torrent.as_ref(), peer).await {
             Ok((_, s)) => Some(s),
             Err(err) => {
-                eprintln!("Rerforming hanshake with peer {peer} failed with error: {err:?}");
+                eprintln!("Performing hanshake with peer {peer} failed with error: {err:?}");
                 None
             }
         };
 
         if stream.is_some() {
-            eprintln!("succesfull handhake with peer: {peer}");
+            eprintln!("Succesfull handhake with peer: {peer}");
             break;
         }
     }
@@ -182,10 +180,77 @@ pub async fn download_piece(
         let torrent =
             torrent::parse_torrent(torrent.as_ref().into()).context("parsing torrent file")?;
 
-        download::download_piece(stream, output, piece, &torrent).await
+        let framer = Framer::new(stream).await?;
+        download::download_piece(framer, output, piece, &torrent).await?;
+        Ok(())
     } else {
         anyhow::bail!("failed to connect to any peer")
     }
+}
+
+pub async fn download_all(
+    output: impl AsRef<Path>,
+    torrent: impl AsRef<Path>,
+) -> anyhow::Result<()> {
+    let peers = discover_peers(torrent.as_ref())
+        .await
+        .context("discovering peers")?
+        .peers;
+
+    if peers.is_empty() {
+        anyhow::bail!("no peers available")
+    }
+
+    let mut peer_streams: Vec<tokio::net::TcpStream> = Vec::new();
+    for &peer in peers.iter() {
+        if let Ok((peer_id, stream)) = handshake(torrent.as_ref(), peer).await.map_err(|err| {
+            eprintln!("Performing hanshake with peer {peer} failed with error: {err:?}")
+        }) {
+            eprintln!("Connected to peer {}", hex::encode(peer_id));
+            peer_streams.push(stream);
+            if peer_streams.len() == MAX_CONNECTED_PEERS {
+                break;
+            }
+        }
+    }
+
+    if peer_streams.is_empty() {
+        anyhow::bail!("failed to connect to any peer")
+    }
+
+    let torrent =
+        torrent::parse_torrent(torrent.as_ref().into()).context("parsing torrent file")?;
+    let pieces_count = torrent.info.hashes.len();
+
+    let mut piece_files = Vec::new();
+
+    // TODO download from more peers
+    let peer_stream = peer_streams
+        .pop()
+        .expect("we are connected to at least one peer");
+
+    let mut framer = Framer::new(peer_stream).await?;
+
+    for piece in 0..pieces_count {
+        let tmp_file = tempfile::NamedTempFile::new()?;
+        let tmp_file_path = tmp_file.into_temp_path().to_path_buf();
+        piece_files.push(tmp_file_path.clone());
+
+        eprintln!("---> downloading piece {}", piece);
+        framer = download::download_piece(framer, tmp_file_path, piece, &torrent).await?;
+        eprintln!("<--- piece {} downloaded", piece);
+    }
+
+    let mut output_file = tokio::fs::File::create(&output).await?;
+
+    for piece_file_name in piece_files {
+        let mut piece_file = tokio::fs::File::open(piece_file_name).await?;
+        tokio::io::copy(&mut piece_file, &mut output_file)
+            .await
+            .with_context(|| format!("writing piece data do file {}", output.as_ref().display()))?;
+    }
+
+    Ok(())
 }
 
 use std::fmt;
