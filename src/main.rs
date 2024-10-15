@@ -4,7 +4,7 @@ mod torrent;
 
 use std::{net::SocketAddrV4, path::PathBuf};
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -43,6 +43,8 @@ enum Command {
         /// Torrent file
         torrent: PathBuf,
     },
+    /// Parse magnet link
+    MagnetParse { magnet_link: String },
 }
 
 #[tokio::main]
@@ -99,6 +101,17 @@ async fn main() -> anyhow::Result<()> {
         Command::Download { output, torrent } => {
             downloader.download_all(&output, &torrent).await?;
             println!("Downloaded {} to {}.", torrent.display(), output.display());
+            Ok(())
+        }
+        Command::MagnetParse { magnet_link } => {
+            let ml = torrent::parse_magnet_link(&magnet_link).context("parsing magnet link")?;
+            println!(
+                "Tracker URL: {}",
+                ml.announce
+                    .ok_or(anyhow!("Missing tracker URL in magnet link"))?
+            );
+            println!("Info Hash: {}", hex::encode(ml.info_hash));
+
             Ok(())
         }
     }

@@ -1,7 +1,7 @@
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 use sha1::Digest;
-use std::{fs, ops::Deref, path::PathBuf};
+use std::{borrow::Cow, fs, ops::Deref, path::PathBuf};
 
 /// Metainfo files (also known as .torrent files) are bencoded dictionaries
 /// https://www.bittorrent.org/beps/bep_0003.html#metainfo-files
@@ -86,4 +86,67 @@ pub fn parse_torrent(file: PathBuf) -> anyhow::Result<Torrent> {
     torrent.info.info_hash = digest.into();
 
     Ok(torrent)
+}
+
+/// Metainfo files (also known as .torrent files) are bencoded dictionaries
+/// https://www.bittorrent.org/beps/bep_0003.html#metainfo-files
+pub struct MagnetLink {
+    /// SHA-1 hash of bencoded `Info` dictionary (required)
+    pub info_hash: [u8; 20],
+    /// The URL of the tracker. A magnet link can contain multiple tracker URLs, but for the purposes of this challenge it'll only contain one.
+    pub announce: Option<String>,
+    #[allow(dead_code)]
+    /// Suggested name to save the file / directory as
+    pub name: Option<String>,
+}
+
+pub fn parse_magnet_link(magnet_link: &str) -> anyhow::Result<MagnetLink> {
+    let mut announce = None;
+    let mut name = None;
+    let mut info_hash = [0u8; 20];
+
+    let url = reqwest::Url::parse(magnet_link)?;
+    for (k, v) in url.query_pairs() {
+        match k {
+            Cow::Borrowed("tr") => announce = Some(v.into_owned()),
+            Cow::Borrowed("dn") => name = Some(v.into_owned()),
+            Cow::Borrowed("xt") => {
+                let ih = v.into_owned();
+                let ih = ih
+                    .strip_prefix("urn:btih:")
+                    .ok_or(anyhow!("malformed magnet link").context("parsing xt param"))?;
+                hex::decode_to_slice(ih, &mut info_hash).context("decode xt from hex to bytes")?;
+            }
+            _ => anyhow::bail!("invalid magnet link: unknown '{}' param", k),
+        }
+    }
+
+    let magnet = MagnetLink {
+        announce,
+        info_hash,
+        name,
+    };
+
+    Ok(magnet)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_magnet_link() {
+        let ml = "magnet:?xt=urn:btih:d69f91e6b2ae4c542468d1073a71d4ea13879a7f&dn=sample.torrent&tr=http%3A%2F%2Fbittorrent-test-tracker.codecrafters.io%2Fannounce";
+        let r = parse_magnet_link(ml).unwrap();
+
+        assert_eq!(
+            r.announce,
+            Some("http://bittorrent-test-tracker.codecrafters.io/announce".to_string())
+        );
+        assert_eq!(r.name, Some("sample.torrent".to_string()));
+        assert_eq!(
+            hex::encode(r.info_hash),
+            "d69f91e6b2ae4c542468d1073a71d4ea13879a7f"
+        );
+    }
 }
