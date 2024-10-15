@@ -17,7 +17,6 @@ use crate::piece::Piece;
 use crate::torrent;
 use framer::Framer;
 
-const PEER_ID: &str = "00112233445566778899";
 const MAX_CONNECTED_PEERS: usize = 5;
 
 #[derive(Deserialize)]
@@ -58,353 +57,391 @@ struct TrackerRequest {
     compact: u8,
 }
 
-pub async fn discover_peers(file: impl AsRef<Path>) -> anyhow::Result<TrackerResponse> {
-    let torrent = torrent::parse_torrent(file.as_ref().into()).context("parsing torrent file")?;
-
-    let request = TrackerRequest {
-        peer_id: String::from(PEER_ID),
-        port: 6881,
-        uploaded: 0,
-        downloaded: 0,
-        left: torrent.info.length,
-        compact: 1,
-    };
-
-    let query = serde_urlencoded::to_string(request).context("serializing request query params")?;
-    let info_hash = torrent.info.info_hash;
-    let url = format!(
-        "{}?{}&info_hash={}",
-        torrent.announce,
-        query,
-        urlencode(&info_hash)
-    );
-
-    // GET /announce?peer_id=aaaaaaaaaaaaaaaaaaaa&info_hash=aaaaaaaaaaaaaaaaaaaa&port=6881&left=0&downloaded=100&uploaded=0&compact=1
-    let response = reqwest::get(url).await.context("querying tracker")?;
-    if !response.status().is_success() {
-        anyhow::bail!("tracker returned error: {}", response.status());
+impl TrackerRequest {
+    fn new(peer_id: &str, left: usize) -> Self {
+        Self {
+            peer_id: peer_id.to_string(),
+            port: 6881,
+            uploaded: 0,
+            downloaded: 0,
+            left,
+            compact: 1,
+        }
     }
-    let response = response.bytes().await.context("reading bytes response")?;
-
-    let tracker_response =
-        serde_bencode::from_bytes(&response).context("deserializing tracker response")?;
-
-    Ok(tracker_response)
 }
 
-pub async fn handshake(
-    file: impl AsRef<Path>,
-    peer_socket: SocketAddrV4,
-) -> anyhow::Result<([u8; 20], tokio::net::TcpStream)> {
-    let torrent = torrent::parse_torrent(file.as_ref().into()).context("parsing torrent file")?;
-
-    let mut stream = tokio::net::TcpStream::connect(peer_socket)
-        .await
-        .context("connecting to peer")?;
-
-    /*
-       The handshake is a message consisting of the following parts as described in the peer protocol:
-
-       * length of the protocol string (BitTorrent protocol) which is 19 (1 byte)
-       * the string BitTorrent protocol (19 bytes)
-       * eight reserved bytes, which are all set to zero (8 bytes)
-       * sha1 infohash (20 bytes) (NOT the hexadecimal representation, which is 40 bytes long)
-       * peer id (20 bytes) (you can use 00112233445566778899 for this challenge)
-    */
-    let handshake_len = 1 + 19 + 8 + 20 + 20;
-    let mut data = bytes::BytesMut::with_capacity(handshake_len);
-    data.put_u8(19);
-    data.put_slice(b"BitTorrent protocol");
-    data.put_bytes(b'\0', 8);
-    data.put_slice(&torrent.info.info_hash);
-    data.put_slice(PEER_ID.as_bytes());
-
-    stream
-        .write_all(&data)
-        .await
-        .context("sending handshake data to peer")?;
-
-    let mut resp = Vec::with_capacity(handshake_len);
-    resp.reserve_exact(handshake_len);
-    resp.put_bytes(b'0', handshake_len);
-    stream
-        .read_exact(&mut resp)
-        .await
-        .context("reading handshake response")?;
-
-    anyhow::ensure!(resp.len() == handshake_len);
-    anyhow::ensure!(resp[0] == 19);
-    anyhow::ensure!(&resp[1..20] == b"BitTorrent protocol");
-
-    let mut remote_peer_id = [0_u8; 20];
-    remote_peer_id.copy_from_slice(&resp[handshake_len - 20..]);
-
-    Ok((remote_peer_id, stream))
+pub struct Downloader {
+    peer_id: String,
 }
 
-fn urlencode(t: &[u8; 20]) -> String {
-    let mut encoded = String::with_capacity(3 * t.len());
-    for &byte in t {
-        encoded.push('%');
-        encoded.push_str(&hex::encode([byte]));
-    }
-    encoded
-}
-
-pub async fn download_piece(
-    output: impl AsRef<Path>,
-    torrent: impl AsRef<Path>,
-    piece: usize,
-) -> anyhow::Result<()> {
-    let peers = discover_peers(torrent.as_ref())
-        .await
-        .context("discovering peers")?
-        .peers;
-
-    if peers.is_empty() {
-        anyhow::bail!("no peers available")
-    }
-
-    let mut stream: Option<tokio::net::TcpStream> = None;
-    for &peer in peers.iter() {
-        stream = match handshake(torrent.as_ref(), peer).await {
-            Ok((_, s)) => Some(s),
-            Err(err) => {
-                eprintln!("Performing hanshake with peer {peer} failed with error: {err:?}");
-                None
-            }
-        };
-
-        if stream.is_some() {
-            eprintln!("Succesfull handhake with peer: {peer}");
-            break;
+impl Downloader {
+    pub fn new() -> Self {
+        Self {
+            peer_id: Self::random_peer_id(),
         }
     }
 
-    if let Some(stream) = stream {
+    /// A string of length 20 which this downloader uses as its id.
+    /// Each downloader generates its own id at random at the start of a new download.
+    /// This value will almost certainly have to be escaped.
+    fn random_peer_id() -> String {
+        std::iter::repeat_with(fastrand::alphanumeric)
+            .take(20)
+            .collect()
+    }
+
+    pub async fn discover_peers(&self, file: impl AsRef<Path>) -> anyhow::Result<TrackerResponse> {
         let torrent =
-            torrent::parse_torrent(torrent.as_ref().into()).context("parsing torrent file")?;
+            torrent::parse_torrent(file.as_ref().into()).context("parsing torrent file")?;
+        let request = TrackerRequest::new(&self.peer_id, torrent.info.length);
 
-        let framer = Framer::new(stream).await?;
-        download::download_piece(framer, output, piece, &torrent).await?;
-        Ok(())
-    } else {
-        anyhow::bail!("failed to connect to any peer")
+        let query =
+            serde_urlencoded::to_string(request).context("serializing request query params")?;
+        let info_hash = torrent.info.info_hash;
+        let url = format!(
+            "{}?{}&info_hash={}",
+            torrent.announce,
+            query,
+            Self::urlencode(&info_hash)
+        );
+
+        // GET /announce?peer_id=aaaaaaaaaaaaaaaaaaaa&info_hash=aaaaaaaaaaaaaaaaaaaa&port=6881&left=0&downloaded=100&uploaded=0&compact=1
+        let response = reqwest::get(url).await.context("querying tracker")?;
+        if !response.status().is_success() {
+            anyhow::bail!("tracker returned error: {}", response.status());
+        }
+        let response = response.bytes().await.context("reading bytes response")?;
+
+        let tracker_response =
+            serde_bencode::from_bytes(&response).context("deserializing tracker response")?;
+
+        Ok(tracker_response)
     }
-}
 
-pub async fn download_all(
-    output: impl AsRef<Path>,
-    torrent: impl AsRef<Path>,
-) -> anyhow::Result<()> {
-    let available_peers = discover_peers(torrent.as_ref())
-        .await
-        .context("discovering peers")?
-        .peers;
+    pub async fn handshake(
+        &self,
+        file: impl AsRef<Path>,
+        peer_socket: SocketAddrV4,
+    ) -> anyhow::Result<([u8; 20], tokio::net::TcpStream)> {
+        let torrent =
+            torrent::parse_torrent(file.as_ref().into()).context("parsing torrent file")?;
 
-    if available_peers.is_empty() {
-        anyhow::bail!("no peers available")
+        let mut stream = tokio::net::TcpStream::connect(peer_socket)
+            .await
+            .context("connecting to peer")?;
+
+        /*
+           The handshake is a message consisting of the following parts as described in the peer protocol:
+
+           * length of the protocol string (BitTorrent protocol) which is 19 (1 byte)
+           * the string BitTorrent protocol (19 bytes)
+           * eight reserved bytes, which are all set to zero (8 bytes)
+           * sha1 infohash (20 bytes) (NOT the hexadecimal representation, which is 40 bytes long)
+           * peer id (20 bytes). A string of length 20 which this downloader uses as its id.
+                Each downloader generates its own id at random at the start of a new download.
+                This value will also almost certainly have to be escaped.
+        */
+        let handshake_len = 1 + 19 + 8 + 20 + 20;
+        let mut data = bytes::BytesMut::with_capacity(handshake_len);
+        data.put_u8(19);
+        data.put_slice(b"BitTorrent protocol");
+        data.put_bytes(b'\0', 8);
+        data.put_slice(&torrent.info.info_hash);
+        data.put_slice(self.peer_id.as_bytes());
+
+        stream
+            .write_all(&data)
+            .await
+            .context("sending handshake data to peer")?;
+
+        let mut resp = Vec::with_capacity(handshake_len);
+        resp.reserve_exact(handshake_len);
+        resp.put_bytes(b'0', handshake_len);
+        stream
+            .read_exact(&mut resp)
+            .await
+            .context("reading handshake response")?;
+
+        anyhow::ensure!(resp.len() == handshake_len);
+        anyhow::ensure!(resp[0] == 19);
+        anyhow::ensure!(&resp[1..20] == b"BitTorrent protocol");
+
+        let mut remote_peer_id = [0_u8; 20];
+        remote_peer_id.copy_from_slice(&resp[handshake_len - 20..]);
+
+        Ok((remote_peer_id, stream))
     }
 
-    let (peer_addrs_tx, mut peer_addrs) =
-        tokio::sync::mpsc::channel::<SocketAddrV4>(MAX_CONNECTED_PEERS);
-    let (peer_streams_tx, mut peer_streams) =
-        tokio::sync::mpsc::channel::<tokio::net::TcpStream>(MAX_CONNECTED_PEERS);
-    let (add_peer_tx, mut add_peer_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let (finished, mut done) = tokio::sync::mpsc::channel::<()>(1);
+    pub async fn download_piece(
+        &self,
+        output: impl AsRef<Path>,
+        torrent: impl AsRef<Path>,
+        piece: usize,
+    ) -> anyhow::Result<()> {
+        let peers = self
+            .discover_peers(torrent.as_ref())
+            .await
+            .context("discovering peers")?
+            .peers;
 
-    let unconnected_available_peers = available_peers;
+        if peers.is_empty() {
+            anyhow::bail!("no peers available")
+        }
 
-    // select peers to connect to
-    tokio::spawn(async move {
-        let mut attempted_connections = 0;
-        let mut unconnected_available_peers_iter = unconnected_available_peers.iter();
+        let mut stream: Option<tokio::net::TcpStream> = None;
+        for &peer in peers.iter() {
+            stream = match self.handshake(torrent.as_ref(), peer).await {
+                Ok((_, s)) => Some(s),
+                Err(err) => {
+                    eprintln!("Performing hanshake with peer {peer} failed with error: {err:?}");
+                    None
+                }
+            };
 
-        for peer in unconnected_available_peers_iter.by_ref() {
-            peer_addrs_tx
-                .send(*peer)
-                .await
-                .expect("peer adresses channel should not be closed");
-            attempted_connections += 1;
-            if attempted_connections == MAX_CONNECTED_PEERS {
+            if stream.is_some() {
+                eprintln!("Succesfull handhake with peer: {peer}");
                 break;
             }
         }
-        eprintln!("Attempting to connect to {} peers", attempted_connections);
 
-        loop {
-            tokio::select! {
-                _ = add_peer_rx.recv() => {
-                    eprintln!("-> Request to add new peer");
-                    if let Some(&addr) = unconnected_available_peers_iter.next() {
-                        eprintln!("-> Adding new peer {}", addr);
-                        peer_addrs_tx
-                            .send(addr)
-                            .await
-                            .expect("peer adresses channel should not be closed");
-                    } else {
-                        eprintln!("-> No available peers left");
-                        break;
-                    };
-                }
-                _ = done.recv() =>
-                {
+        if let Some(stream) = stream {
+            let torrent =
+                torrent::parse_torrent(torrent.as_ref().into()).context("parsing torrent file")?;
+
+            let framer = Framer::new(stream).await?;
+            download::download_piece(framer, output, piece, &torrent).await?;
+            Ok(())
+        } else {
+            anyhow::bail!("failed to connect to any peer")
+        }
+    }
+
+    pub async fn download_all(
+        self,
+        output: impl AsRef<Path>,
+        torrent: impl AsRef<Path>,
+    ) -> anyhow::Result<()> {
+        let available_peers = self
+            .discover_peers(torrent.as_ref())
+            .await
+            .context("discovering peers")?
+            .peers;
+
+        if available_peers.is_empty() {
+            anyhow::bail!("no peers available")
+        }
+
+        let (peer_addrs_tx, mut peer_addrs) =
+            tokio::sync::mpsc::channel::<SocketAddrV4>(MAX_CONNECTED_PEERS);
+        let (peer_streams_tx, mut peer_streams) =
+            tokio::sync::mpsc::channel::<tokio::net::TcpStream>(MAX_CONNECTED_PEERS);
+        let (add_peer_tx, mut add_peer_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (finished, mut done) = tokio::sync::mpsc::channel::<()>(1);
+
+        let unconnected_available_peers = available_peers;
+
+        // select peers to connect to
+        tokio::spawn(async move {
+            let mut attempted_connections = 0;
+            let mut unconnected_available_peers_iter = unconnected_available_peers.iter();
+
+            for peer in unconnected_available_peers_iter.by_ref() {
+                peer_addrs_tx
+                    .send(*peer)
+                    .await
+                    .expect("peer adresses channel should not be closed");
+                attempted_connections += 1;
+                if attempted_connections == MAX_CONNECTED_PEERS {
                     break;
                 }
-                else => { break; } // both channels closed
             }
-        }
+            eprintln!("Attempting to connect to {} peers", attempted_connections);
 
-        eprintln!("Adding new peers loop finished");
-    });
-
-    // connect to peers
-    let torrent_path = PathBuf::from(torrent.as_ref());
-    tokio::spawn(async move {
-        let mut connected_peers = 0;
-        while let Some(peer) = peer_addrs.recv().await {
-            let torrent = torrent_path.clone();
-            if let Ok((peer_id, stream)) = handshake(torrent, peer).await.map_err(|err| {
-                eprintln!("Performing hanshake with peer {peer} failed with error:\n{err:?}")
-            }) {
-                eprintln!("Connected to peer {}", hex::encode(peer_id));
-                connected_peers += 1;
-                peer_streams_tx
-                    .send(stream)
-                    .await
-                    .expect("peer streams channel should not not be closed");
-            }
-        }
-        assert!(connected_peers > 0, "failed to connect to any peer");
-
-        eprintln!("Connecting to {} peers finished", connected_peers);
-    });
-
-    let torrent =
-        torrent::parse_torrent(torrent.as_ref().into()).context("parsing torrent file")?;
-    let pieces_count = torrent.info.hashes.len();
-
-    // we need MPMC channel for the task queue
-    let (needed_pieces, tasks) = kanal::bounded_async::<Piece>(pieces_count);
-    let errored_pieces = needed_pieces.clone();
-
-    tokio::spawn(async move {
-        // send all pieces to the queue
-        for piece_index in 0..pieces_count {
-            let tmp_file =
-                tempfile::NamedTempFile::new().expect("creating tmp file should proceed");
-            let tmp_file_path = tmp_file.into_temp_path().to_path_buf();
-            let piece = Piece {
-                index: piece_index,
-                file_path: tmp_file_path.clone(),
-            };
-
-            needed_pieces
-                .send(piece)
-                .await
-                .expect("tasks should not be closed");
-        }
-        eprintln!("All {} needed pieces sent to the queue", pieces_count);
-    });
-
-    let (pieces_tx, mut downloaded_pieces) = tokio::sync::mpsc::channel::<Piece>(pieces_count);
-
-    let downloaded_counter = Arc::new(atomic::AtomicUsize::new(0));
-
-    // every peer connection will take a piece to download from the queue
-    eprintln!("Starting download queue");
-    while let Some(peer_stream) = peer_streams.recv().await {
-        let mut framer = Framer::new(peer_stream).await?;
-
-        let tasks = tasks.clone();
-        let pieces_tx = pieces_tx.clone();
-        let errored_pieces = errored_pieces.clone();
-        let add_peer_tx = add_peer_tx.clone();
-        let finished = finished.clone();
-        let torrent = torrent.clone();
-
-        let downloaded_counter = Arc::clone(&downloaded_counter);
-        tokio::spawn(async move {
-            while let Ok(piece) = tasks.recv().await {
-                let piece_index = piece.index;
-                eprintln!("---> downloading piece {}", piece_index);
-                match download::download_piece(
-                    framer,
-                    piece.file_path.clone(),
-                    piece.index,
-                    &torrent,
-                )
-                .await
-                {
-                    Ok(f) => {
-                        framer = f;
-                        pieces_tx
-                            .send(piece)
-                            .await
-                            .expect("pieces receiver should not be closed");
-
-                        downloaded_counter.fetch_add(1, atomic::Ordering::AcqRel);
+            loop {
+                tokio::select! {
+                    _ = add_peer_rx.recv() => {
+                        eprintln!("-> Request to add new peer");
+                        if let Some(&addr) = unconnected_available_peers_iter.next() {
+                            eprintln!("-> Adding new peer {}", addr);
+                            peer_addrs_tx
+                                .send(addr)
+                                .await
+                                .expect("peer adresses channel should not be closed");
+                        } else {
+                            eprintln!("-> No available peers left");
+                            break;
+                        };
                     }
+                    _ = done.recv() =>
+                    {
+                        break;
+                    }
+                    else => { break; } // both channels closed
+                }
+            }
 
-                    Err(err) => {
-                        // return failed piece back to the queue
-                        eprintln!("{:?}, returning piece {} to the queue", err, piece_index);
-                        errored_pieces
-                            .send(piece)
-                            .await
-                            .expect("needed pieces queue shoud not be closed");
+            eprintln!("Adding new peers loop finished");
+        });
 
-                        // connect to some new peer
-                        if !add_peer_tx.is_closed() {
-                            add_peer_tx
+        // connect to peers
+        let torrent_path = PathBuf::from(torrent.as_ref());
+        tokio::spawn(async move {
+            let mut connected_peers = 0;
+            while let Some(peer) = peer_addrs.recv().await {
+                let torrent = torrent_path.clone();
+                if let Ok((peer_id, stream)) = self.handshake(torrent, peer).await.map_err(|err| {
+                    eprintln!("Performing hanshake with peer {peer} failed with error:\n{err:?}")
+                }) {
+                    eprintln!("Connected to peer {}", hex::encode(peer_id));
+                    connected_peers += 1;
+                    peer_streams_tx
+                        .send(stream)
+                        .await
+                        .expect("peer streams channel should not not be closed");
+                }
+            }
+            assert!(connected_peers > 0, "failed to connect to any peer");
+
+            eprintln!("Connecting to {} peers finished", connected_peers);
+        });
+
+        let torrent =
+            torrent::parse_torrent(torrent.as_ref().into()).context("parsing torrent file")?;
+        let pieces_count = torrent.info.hashes.len();
+
+        // we need MPMC channel for the task queue
+        let (needed_pieces, tasks) = kanal::bounded_async::<Piece>(pieces_count);
+        let errored_pieces = needed_pieces.clone();
+
+        tokio::spawn(async move {
+            // send all pieces to the queue
+            for piece_index in 0..pieces_count {
+                let tmp_file =
+                    tempfile::NamedTempFile::new().expect("creating tmp file should proceed");
+                let tmp_file_path = tmp_file.into_temp_path().to_path_buf();
+                let piece = Piece {
+                    index: piece_index,
+                    file_path: tmp_file_path.clone(),
+                };
+
+                needed_pieces
+                    .send(piece)
+                    .await
+                    .expect("tasks should not be closed");
+            }
+            eprintln!("All {} needed pieces sent to the queue", pieces_count);
+        });
+
+        let (pieces_tx, mut downloaded_pieces) = tokio::sync::mpsc::channel::<Piece>(pieces_count);
+
+        let downloaded_counter = Arc::new(atomic::AtomicUsize::new(0));
+
+        // every peer connection will take a piece to download from the queue
+        eprintln!("Starting download queue");
+        while let Some(peer_stream) = peer_streams.recv().await {
+            let mut framer = Framer::new(peer_stream).await?;
+
+            let tasks = tasks.clone();
+            let pieces_tx = pieces_tx.clone();
+            let errored_pieces = errored_pieces.clone();
+            let add_peer_tx = add_peer_tx.clone();
+            let finished = finished.clone();
+            let torrent = torrent.clone();
+
+            let downloaded_counter = Arc::clone(&downloaded_counter);
+            tokio::spawn(async move {
+                while let Ok(piece) = tasks.recv().await {
+                    let piece_index = piece.index;
+                    eprintln!("---> downloading piece {}", piece_index);
+                    match download::download_piece(
+                        framer,
+                        piece.file_path.clone(),
+                        piece.index,
+                        &torrent,
+                    )
+                    .await
+                    {
+                        Ok(f) => {
+                            framer = f;
+                            pieces_tx
+                                .send(piece)
+                                .await
+                                .expect("pieces receiver should not be closed");
+
+                            downloaded_counter.fetch_add(1, atomic::Ordering::AcqRel);
+                        }
+
+                        Err(err) => {
+                            // return failed piece back to the queue
+                            eprintln!("{:?}, returning piece {} to the queue", err, piece_index);
+                            errored_pieces
+                                .send(piece)
+                                .await
+                                .expect("needed pieces queue shoud not be closed");
+
+                            // connect to some new peer
+                            if !add_peer_tx.is_closed() {
+                                add_peer_tx
+                                    .send(())
+                                    .await
+                                    .expect("add_peer channel is not closed");
+                            }
+                            // TODO Reconnect to the failed peer? (ie. add it to the list of available peers again?)
+
+                            break;
+                        }
+                    }
+                    eprintln!("<--- piece {} downloaded", piece_index);
+
+                    if downloaded_counter.load(atomic::Ordering::Acquire) == pieces_count {
+                        eprintln!(
+                            "All {} pieces downloaded, closing download queue",
+                            pieces_count
+                        );
+                        if !finished.is_closed() {
+                            finished
                                 .send(())
                                 .await
-                                .expect("add_peer channel is not closed");
+                                .expect("finished channel is not closed");
+                            break;
                         }
-                        // TODO Reconnect to the failed peer? (ie. add it to the list of available peers again?)
-
-                        break;
                     }
                 }
-                eprintln!("<--- piece {} downloaded", piece_index);
-
-                if downloaded_counter.load(atomic::Ordering::Acquire) == pieces_count {
-                    eprintln!(
-                        "All {} pieces downloaded, closing download queue",
-                        pieces_count
-                    );
-                    if !finished.is_closed() {
-                        finished
-                            .send(())
-                            .await
-                            .expect("finished channel is not closed");
-                        break;
-                    }
-                }
-            }
-        });
-    }
-
-    let mut piece_files = BTreeMap::new();
-
-    while let Some(piece) = downloaded_pieces.recv().await {
-        eprintln!("<<< received piece {}", piece.index);
-        piece_files.insert(piece.index, piece.file_path);
-        if piece_files.len() == pieces_count {
-            break;
+            });
         }
+
+        let mut piece_files = BTreeMap::new();
+
+        while let Some(piece) = downloaded_pieces.recv().await {
+            eprintln!("<<< received piece {}", piece.index);
+            piece_files.insert(piece.index, piece.file_path);
+            if piece_files.len() == pieces_count {
+                break;
+            }
+        }
+
+        let mut output_file = tokio::fs::File::create(&output).await?;
+
+        for (_, file_name) in piece_files {
+            let mut piece_file = tokio::fs::File::open(file_name).await?;
+            tokio::io::copy(&mut piece_file, &mut output_file)
+                .await
+                .with_context(|| {
+                    format!("writing piece data to file {}", output.as_ref().display())
+                })?;
+        }
+
+        Ok(())
     }
 
-    let mut output_file = tokio::fs::File::create(&output).await?;
-
-    for (_, file_name) in piece_files {
-        let mut piece_file = tokio::fs::File::open(file_name).await?;
-        tokio::io::copy(&mut piece_file, &mut output_file)
-            .await
-            .with_context(|| format!("writing piece data to file {}", output.as_ref().display()))?;
+    fn urlencode(t: &[u8; 20]) -> String {
+        let mut encoded = String::with_capacity(3 * t.len());
+        for &byte in t {
+            encoded.push('%');
+            encoded.push_str(&hex::encode([byte]));
+        }
+        encoded
     }
-
-    Ok(())
 }
 
 use std::fmt;

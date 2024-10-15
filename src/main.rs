@@ -47,6 +47,8 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let downloader = peer::Downloader::new();
+
     let args = Cli::parse();
     match args.command {
         Command::Decode { value } => {
@@ -67,7 +69,8 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Peers { file } => {
-            let tracker_response = peer::discover_peers(file)
+            let tracker_response = downloader
+                .discover_peers(file)
                 .await
                 .context("discovering peers")?;
             for &peer in tracker_response.peers.iter() {
@@ -80,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
                 .parse::<SocketAddrV4>()
                 .context("parsing peer address")?;
 
-            let (remote_peer_id, _) = peer::handshake(file, peer_socket).await?;
+            let (remote_peer_id, _) = downloader.handshake(file, peer_socket).await?;
             println!("Peer ID: {}", hex::encode(remote_peer_id));
             Ok(())
         }
@@ -89,12 +92,12 @@ async fn main() -> anyhow::Result<()> {
             torrent,
             piece,
         } => {
-            peer::download_piece(&output, torrent, piece).await?;
+            downloader.download_piece(&output, torrent, piece).await?;
             println!("Piece {} downloaded to {}.", piece, output.display());
             Ok(())
         }
         Command::Download { output, torrent } => {
-            peer::download_all(&output, &torrent).await?;
+            downloader.download_all(&output, &torrent).await?;
             println!("Downloaded {} to {}.", torrent.display(), output.display());
             Ok(())
         }
