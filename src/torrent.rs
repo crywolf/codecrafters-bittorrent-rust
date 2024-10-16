@@ -5,7 +5,7 @@ use std::{borrow::Cow, fs, ops::Deref, path::PathBuf};
 
 /// Metainfo files (also known as .torrent files) are bencoded dictionaries
 /// https://www.bittorrent.org/beps/bep_0003.html#metainfo-files
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Debug)]
 pub struct Torrent {
     /// The URL of the tracker, which is a central server
     /// that keeps track of peers participating in the sharing of a torrent
@@ -13,9 +13,13 @@ pub struct Torrent {
 
     /// Info dictionary with keys described below
     pub info: Info,
+
+    /// Torrent was obtainded from magnet link
+    #[serde(skip)]
+    pub from_magnet_link: bool,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, Debug)]
 pub struct Info {
     /// size of the file in bytes, for single-file torrents
     pub length: usize,
@@ -45,7 +49,34 @@ pub struct Info {
     pub info_hash: [u8; 20],
 }
 
-#[derive(Clone, Default)]
+impl Torrent {
+    pub fn from_magnet(magnet: Magnet) -> Self {
+        let mut info = Info::new();
+        info.info_hash = magnet.info_hash;
+        info.length = 999; // workaround: cannot be zero, but we do not know the file length
+
+        Self {
+            announce: magnet.announce.unwrap(),
+            info,
+            from_magnet_link: true,
+        }
+    }
+}
+
+impl Info {
+    pub fn new() -> Self {
+        Self {
+            length: 0,
+            name: String::new(),
+            piece_length: 0,
+            pieces: Vec::new(),
+            hashes: Hashes::default(),
+            info_hash: [0u8; 20],
+        }
+    }
+}
+
+#[derive(Clone, Default, Debug)]
 pub struct Hashes(Vec<[u8; 20]>);
 
 impl Deref for Hashes {
@@ -88,9 +119,10 @@ pub fn parse_torrent(file: PathBuf) -> anyhow::Result<Torrent> {
     Ok(torrent)
 }
 
-/// Metainfo files (also known as .torrent files) are bencoded dictionaries
-/// https://www.bittorrent.org/beps/bep_0003.html#metainfo-files
-pub struct MagnetLink {
+/// Magnet links allow users to download files from peers without needing a torrent file.
+/// https://www.bittorrent.org/beps/bep_0009.html
+/// https://en.wikipedia.org/wiki/Magnet_URI_scheme
+pub struct Magnet {
     /// SHA-1 hash of bencoded `Info` dictionary (required)
     pub info_hash: [u8; 20],
     /// The URL of the tracker. A magnet link can contain multiple tracker URLs, but for the purposes of this challenge it'll only contain one.
@@ -100,7 +132,7 @@ pub struct MagnetLink {
     pub name: Option<String>,
 }
 
-pub fn parse_magnet_link(magnet_link: &str) -> anyhow::Result<MagnetLink> {
+pub fn parse_magnet_link(magnet_link: &str) -> anyhow::Result<Magnet> {
     let mut announce = None;
     let mut name = None;
     let mut info_hash = [0u8; 20];
@@ -121,7 +153,7 @@ pub fn parse_magnet_link(magnet_link: &str) -> anyhow::Result<MagnetLink> {
         }
     }
 
-    let magnet = MagnetLink {
+    let magnet = Magnet {
         announce,
         info_hash,
         name,

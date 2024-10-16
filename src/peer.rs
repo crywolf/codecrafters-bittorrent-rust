@@ -5,7 +5,7 @@ mod framer;
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::ops::Deref;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{atomic, Arc};
 
 use anyhow::Context;
@@ -14,7 +14,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::piece::Piece;
-use crate::torrent;
+use crate::torrent::Torrent;
 use framer::Framer;
 
 const MAX_CONNECTED_PEERS: usize = 5;
@@ -23,7 +23,7 @@ const MAX_CONNECTED_PEERS: usize = 5;
 pub struct TrackerResponse {
     /// An integer, indicating how often (in seconds) the client should make a request to the tracker. Ignored in this challenge.
     #[allow(dead_code)]
-    pub interval: u64,
+    pub interval: Option<u64>,
     /// List of peers that the client can connect to.
     pub peers: Peers,
 }
@@ -90,9 +90,7 @@ impl Downloader {
             .collect()
     }
 
-    pub async fn discover_peers(&self, file: impl AsRef<Path>) -> anyhow::Result<TrackerResponse> {
-        let torrent =
-            torrent::parse_torrent(file.as_ref().into()).context("parsing torrent file")?;
+    pub async fn discover_peers(&self, torrent: &Torrent) -> anyhow::Result<TrackerResponse> {
         let request = TrackerRequest::new(&self.peer_id, torrent.info.length);
 
         let query =
@@ -120,12 +118,9 @@ impl Downloader {
 
     pub async fn handshake(
         &self,
-        file: impl AsRef<Path>,
+        torrent: &Torrent,
         peer_socket: SocketAddrV4,
     ) -> anyhow::Result<([u8; 20], tokio::net::TcpStream)> {
-        let torrent =
-            torrent::parse_torrent(file.as_ref().into()).context("parsing torrent file")?;
-
         let mut stream = tokio::net::TcpStream::connect(peer_socket)
             .await
             .context("connecting to peer")?;
@@ -135,17 +130,40 @@ impl Downloader {
 
            * length of the protocol string (BitTorrent protocol) which is 19 (1 byte)
            * the string BitTorrent protocol (19 bytes)
-           * eight reserved bytes, which are all set to zero (8 bytes)
+           * eight reserved bytes - see below 1)
            * sha1 infohash (20 bytes) (NOT the hexadecimal representation, which is 40 bytes long)
            * peer id (20 bytes). A string of length 20 which this downloader uses as its id.
                 Each downloader generates its own id at random at the start of a new download.
                 This value will also almost certainly have to be escaped.
+
+            1) Reserved bytes: During the "Peer handshake" stage, the handshake message includes eight reserved bytes (64 bits), all set to zero.
+            To signal support for extensions, a client must set the 20th bit from the right (counting starts at 0) in the reserved bytes to 1.
+            In Hex, here's how the reserved bytes will look like after setting the 20th bit from the right to 1:
+
+            .... 00010000 00000000 00000000
+                    ^ 20th bit from the right, counting starts at 0
+
+            00 00 00 00 00 10 00 00
+            (10 in hex is 16 in decimal, which is 00010000 in binary)
         */
+
         let handshake_len = 1 + 19 + 8 + 20 + 20;
         let mut data = bytes::BytesMut::with_capacity(handshake_len);
         data.put_u8(19);
         data.put_slice(b"BitTorrent protocol");
-        data.put_bytes(b'\0', 8);
+
+        if torrent.from_magnet_link {
+            // signal support for extensions
+            // 00 00 00 00 00 10 00 00
+            data.put_bytes(b'\0', 5);
+            data.put_u8(16);
+            data.put_bytes(b'\0', 2);
+        } else {
+            // 8 zero bytes
+            // 00 00 00 00 00 00 00 00
+            data.put_bytes(b'\0', 8);
+        }
+
         data.put_slice(&torrent.info.info_hash);
         data.put_slice(self.peer_id.as_bytes());
 
@@ -175,11 +193,11 @@ impl Downloader {
     pub async fn download_piece(
         &self,
         output: impl AsRef<Path>,
-        torrent: impl AsRef<Path>,
+        torrent: Torrent,
         piece: usize,
     ) -> anyhow::Result<()> {
         let peers = self
-            .discover_peers(torrent.as_ref())
+            .discover_peers(&torrent)
             .await
             .context("discovering peers")?
             .peers;
@@ -190,7 +208,7 @@ impl Downloader {
 
         let mut stream: Option<tokio::net::TcpStream> = None;
         for &peer in peers.iter() {
-            stream = match self.handshake(torrent.as_ref(), peer).await {
+            stream = match self.handshake(&torrent, peer).await {
                 Ok((_, s)) => Some(s),
                 Err(err) => {
                     eprintln!("Performing hanshake with peer {peer} failed with error: {err:?}");
@@ -205,9 +223,6 @@ impl Downloader {
         }
 
         if let Some(stream) = stream {
-            let torrent =
-                torrent::parse_torrent(torrent.as_ref().into()).context("parsing torrent file")?;
-
             let framer = Framer::new(stream).await?;
             download::download_piece(framer, output, piece, &torrent).await?;
             Ok(())
@@ -219,10 +234,10 @@ impl Downloader {
     pub async fn download_all(
         self,
         output: impl AsRef<Path>,
-        torrent: impl AsRef<Path>,
+        torrent: Torrent,
     ) -> anyhow::Result<()> {
         let available_peers = self
-            .discover_peers(torrent.as_ref())
+            .discover_peers(&torrent)
             .await
             .context("discovering peers")?
             .peers;
@@ -283,15 +298,21 @@ impl Downloader {
             eprintln!("Adding new peers loop finished");
         });
 
+        let cloned_torrent = torrent.clone();
+
         // connect to peers
-        let torrent_path = PathBuf::from(torrent.as_ref());
+        //let torrent_path = PathBuf::from(torrent_file.as_ref());
         tokio::spawn(async move {
             let mut connected_peers = 0;
             while let Some(peer) = peer_addrs.recv().await {
-                let torrent = torrent_path.clone();
-                if let Ok((peer_id, stream)) = self.handshake(torrent, peer).await.map_err(|err| {
-                    eprintln!("Performing hanshake with peer {peer} failed with error:\n{err:?}")
-                }) {
+                //let torrent = torrent_path.clone();
+                if let Ok((peer_id, stream)) =
+                    self.handshake(&cloned_torrent, peer).await.map_err(|err| {
+                        eprintln!(
+                            "Performing hanshake with peer {peer} failed with error:\n{err:?}"
+                        )
+                    })
+                {
                     eprintln!("Connected to peer {}", hex::encode(peer_id));
                     connected_peers += 1;
                     peer_streams_tx
@@ -305,8 +326,8 @@ impl Downloader {
             eprintln!("Connecting to {} peers finished", connected_peers);
         });
 
-        let torrent =
-            torrent::parse_torrent(torrent.as_ref().into()).context("parsing torrent file")?;
+        // let torrent =
+        //     torrent::parse_torrent(torrent_file.as_ref().into()).context("parsing torrent file")?;
         let pieces_count = torrent.info.hashes.len();
 
         // we need MPMC channel for the task queue

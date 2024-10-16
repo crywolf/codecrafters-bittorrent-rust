@@ -6,6 +6,7 @@ use std::{net::SocketAddrV4, path::PathBuf};
 
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
+use torrent::Torrent;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -45,6 +46,8 @@ enum Command {
     },
     /// Parse magnet link
     MagnetParse { magnet_link: String },
+    /// Establish a TCP connection with a peer and complete a handshake using a magnet link
+    MagnetHandshake { magnet_link: String },
 }
 
 #[tokio::main]
@@ -71,8 +74,9 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Peers { file } => {
+            let torrent = torrent::parse_torrent(file).context("parsing torrent file")?;
             let tracker_response = downloader
-                .discover_peers(file)
+                .discover_peers(&torrent)
                 .await
                 .context("discovering peers")?;
             for &peer in tracker_response.peers.iter() {
@@ -81,11 +85,12 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Handshake { file, peer_socket } => {
+            let torrent = torrent::parse_torrent(file).context("parsing torrent file")?;
             let peer_socket = peer_socket
                 .parse::<SocketAddrV4>()
                 .context("parsing peer address")?;
 
-            let (remote_peer_id, _) = downloader.handshake(file, peer_socket).await?;
+            let (remote_peer_id, _) = downloader.handshake(&torrent, peer_socket).await?;
             println!("Peer ID: {}", hex::encode(remote_peer_id));
             Ok(())
         }
@@ -94,24 +99,52 @@ async fn main() -> anyhow::Result<()> {
             torrent,
             piece,
         } => {
+            let torrent = torrent::parse_torrent(torrent).context("parsing torrent file")?;
+
             downloader.download_piece(&output, torrent, piece).await?;
             println!("Piece {} downloaded to {}.", piece, output.display());
             Ok(())
         }
         Command::Download { output, torrent } => {
-            downloader.download_all(&output, &torrent).await?;
-            println!("Downloaded {} to {}.", torrent.display(), output.display());
+            let torrent_file = torrent;
+            let torrent =
+                torrent::parse_torrent(torrent_file.clone()).context("parsing torrent file")?;
+
+            downloader.download_all(&output, torrent).await?;
+            println!(
+                "Downloaded {} to {}.",
+                torrent_file.display(),
+                output.display()
+            );
             Ok(())
         }
         Command::MagnetParse { magnet_link } => {
-            let ml = torrent::parse_magnet_link(&magnet_link).context("parsing magnet link")?;
+            let magnet = torrent::parse_magnet_link(&magnet_link).context("parsing magnet link")?;
             println!(
                 "Tracker URL: {}",
-                ml.announce
+                magnet
+                    .announce
                     .ok_or(anyhow!("Missing tracker URL in magnet link"))?
             );
-            println!("Info Hash: {}", hex::encode(ml.info_hash));
+            println!("Info Hash: {}", hex::encode(magnet.info_hash));
 
+            Ok(())
+        }
+        Command::MagnetHandshake { magnet_link } => {
+            let magnet = torrent::parse_magnet_link(&magnet_link).context("parsing magnet link")?;
+            let torrent = Torrent::from_magnet(magnet);
+
+            let tracker_response = downloader
+                .discover_peers(&torrent)
+                .await
+                .context("discovering peers")?;
+            let &peer_socket = tracker_response
+                .peers
+                .first()
+                .ok_or(anyhow!("Could not find any peer"))?;
+
+            let (remote_peer_id, _) = downloader.handshake(&torrent, peer_socket).await?;
+            println!("Peer ID: {}", hex::encode(remote_peer_id));
             Ok(())
         }
     }
