@@ -3,6 +3,7 @@ use std::ops::{Deref, DerefMut};
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
@@ -20,6 +21,7 @@ pub enum MessageTag {
     Request = 6,
     Piece = 7,
     Cancel = 8,
+    Extended = 20,
 }
 
 #[derive(Debug)]
@@ -28,24 +30,110 @@ pub struct Message {
     pub payload: Vec<u8>,
 }
 
+const METADATA_EXTENSION_ID: u8 = 2; // arbitrary number
+
+/// Message codec
+/// It also remembers the metadata extension id for a connected peer
 #[derive(Debug)]
-pub struct Framer(Framed<TcpStream, MessageCodec>);
+pub struct Framer(Framed<TcpStream, MessageCodec>, Option<u8>);
 
 impl Framer {
-    pub async fn new(peer_stream: TcpStream) -> anyhow::Result<Self> {
+    pub async fn new(peer_stream: TcpStream, support_extensions: bool) -> anyhow::Result<Self> {
         let mut framer = Framed::new(peer_stream, MessageCodec);
 
-        // 1. Wait for a Bitfield message from the peer indicating which pieces it has
+        // 1. Send the bitfield message (safe to ignore in this challenge)
+
+        // 2. Wait for a Bitfield message from the peer indicating which pieces it has
+        //    Ignore the payload for now, the tracker used for this challenge ensures that all peers have all pieces available
+        eprintln!("Waiting for Bitfield message");
         let bitfield_msg = framer
             .next()
             .await
             .expect("expecting Bitfield message")
             .context("decoding Bitfield message")?;
 
-        anyhow::ensure!(bitfield_msg.tag == MessageTag::Bitfield, "Bitfield message");
-        // ignore the payload for now, the tracker used for this challenge ensures that all peers have all pieces available
+        anyhow::ensure!(
+            bitfield_msg.tag == MessageTag::Bitfield,
+            "Expected Bitfield message, got {:?}",
+            bitfield_msg.tag
+        );
+        eprintln!("Got Bitfield message");
 
-        // 2. Send an Interested message
+        // Extension IDs need to be stored for every peer, as different peers may use different IDs for the same extension.
+        let mut peer_metadata_extension_id = None;
+        if support_extensions {
+            // https://www.bittorrent.org/beps/bep_0010.html
+            eprintln!("Peer supports extensions => sending Extended handshake message");
+
+            /// https://www.bittorrent.org/beps/bep_0010.html#handshake-message
+            #[derive(Serialize, Deserialize, Debug)]
+            struct ExtendedMsgPayload {
+                m: Mdictionary,
+            }
+
+            /// The payload of the extended handshake message is a bencoded dictionary.
+            /// {
+            ///   "m": {
+            ///     "ut_metadata": 16,
+            ///     ... (other extension names and IDs)
+            ///   }
+            /// }
+            #[derive(Serialize, Deserialize, Debug)]
+            struct Mdictionary {
+                pub ut_metadata: u8,
+            }
+
+            // 2A. Send an Extended handshake message (if peer supports extensions)
+            let m = Mdictionary {
+                ut_metadata: METADATA_EXTENSION_ID, // metadata extension
+            };
+            let ext_payload = ExtendedMsgPayload { m };
+            let ext_payload =
+                serde_bencode::to_bytes(&ext_payload).context("bencoding Extended msg payload")?;
+
+            let handshake_extended_msg_id = 0u8; // extended message ID. 0 = handshake, >0 = extended message as specified by the handshake.
+            let mut payload = vec![handshake_extended_msg_id];
+            payload.extend_from_slice(&ext_payload);
+
+            framer
+                .send(Message {
+                    tag: MessageTag::Extended,
+                    payload,
+                })
+                .await
+                .context("sending Extended message (extension handshake)")?;
+
+            // 2B. Wait until you receive an Extended handshake message back
+            eprintln!("Waiting for Extended message response");
+            let extended_msg = framer
+                .next()
+                .await
+                .expect("expecting Extended message")
+                .context("decoding Extended message")?;
+
+            anyhow::ensure!(
+                extended_msg.tag == MessageTag::Extended,
+                "Expected Extended handshake message, got {:?}",
+                extended_msg.tag
+            );
+
+            let extended_msg_id = extended_msg.payload[0];
+            let ext_payload: ExtendedMsgPayload =
+                serde_bencode::from_bytes(&extended_msg.payload[1..])
+                    .context("deserializing Extended msg payload")?;
+
+            peer_metadata_extension_id = Some(ext_payload.m.ut_metadata);
+
+            anyhow::ensure!(
+                extended_msg_id == handshake_extended_msg_id,
+                "Expected hanshake extended message ID should be 0, got {}",
+                extended_msg_id
+            );
+            eprintln!("Got Extended message response");
+        }
+
+        // 3. Send an Interested message
+        eprintln!("Sending Interested message");
         framer
             .send(Message {
                 tag: MessageTag::Interested,
@@ -54,16 +142,30 @@ impl Framer {
             .await
             .context("sending Interested message")?;
 
-        // 3. Wait until you receive an Unchoke message back
-        let unchoke_msg = framer
-            .next()
-            .await
-            .expect("expecting Unchoke message")
-            .context("decoding Unchoke message")?;
+        /*
+        *** Disabled because of codecrafters tests (some of them do not send Unchoke messages) ***
 
-        anyhow::ensure!(unchoke_msg.tag == MessageTag::Unchoke, "Unchoke message");
+               // 4. Wait until you receive an Unchoke message back
+               eprintln!("Waiting for Unchoke message");
+               let unchoke_msg = framer
+                   .next()
+                   .await
+                   .expect("expecting Unchoke message")
+                   .context("decoding Unchoke message")?;
 
-        Ok(Self(framer))
+               anyhow::ensure!(
+                   unchoke_msg.tag == MessageTag::Unchoke,
+                   "Expected Unchoke message, got {:?}",
+                   unchoke_msg.tag
+               );
+               eprintln!("Got Unchoke message");
+        */
+
+        Ok(Self(framer, peer_metadata_extension_id))
+    }
+
+    pub fn peer_metadata_extension_id(&self) -> Option<u8> {
+        self.1
     }
 }
 

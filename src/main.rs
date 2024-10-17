@@ -4,6 +4,7 @@ mod torrent;
 
 use std::{net::SocketAddrV4, path::PathBuf};
 
+use crate::peer::framer::Framer;
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
 use torrent::Torrent;
@@ -52,7 +53,7 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let downloader = peer::Downloader::new();
+    let mut downloader = peer::Downloader::new();
 
     let args = Cli::parse();
     match args.command {
@@ -143,8 +144,16 @@ async fn main() -> anyhow::Result<()> {
                 .first()
                 .ok_or(anyhow!("Could not find any peer"))?;
 
-            let (remote_peer_id, _) = downloader.handshake(&torrent, peer_socket).await?;
+            let (remote_peer_id, stream) = downloader.handshake(&torrent, peer_socket).await?;
+
+            let ext_support = downloader.does_peer_support_extensions(&remote_peer_id);
+            let framer = Framer::new(stream, ext_support).await?;
+
             println!("Peer ID: {}", hex::encode(remote_peer_id));
+            if let Some(peer_extension_id) = framer.peer_metadata_extension_id() {
+                println!("Peer Metadata Extension ID: {}", peer_extension_id);
+            }
+
             Ok(())
         }
     }

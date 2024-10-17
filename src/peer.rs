@@ -1,8 +1,8 @@
 mod codec;
 mod download;
-mod framer;
+pub mod framer;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::ops::Deref;
 use std::path::Path;
@@ -71,23 +71,21 @@ impl TrackerRequest {
 }
 
 pub struct Downloader {
+    /// Peer ID of the downloader
     peer_id: String,
+    peers_supporting_extensions: HashSet<[u8; 20]>, // TODO peer id as a type
 }
 
 impl Downloader {
     pub fn new() -> Self {
         Self {
             peer_id: Self::random_peer_id(),
+            peers_supporting_extensions: HashSet::new(),
         }
     }
 
-    /// A string of length 20 which this downloader uses as its id.
-    /// Each downloader generates its own id at random at the start of a new download.
-    /// This value will almost certainly have to be escaped.
-    fn random_peer_id() -> String {
-        std::iter::repeat_with(fastrand::alphanumeric)
-            .take(20)
-            .collect()
+    pub fn does_peer_support_extensions(&self, peer_id: &[u8; 20]) -> bool {
+        self.peers_supporting_extensions.contains(peer_id)
     }
 
     pub async fn discover_peers(&self, torrent: &Torrent) -> anyhow::Result<TrackerResponse> {
@@ -117,7 +115,7 @@ impl Downloader {
     }
 
     pub async fn handshake(
-        &self,
+        &mut self,
         torrent: &Torrent,
         peer_socket: SocketAddrV4,
     ) -> anyhow::Result<([u8; 20], tokio::net::TcpStream)> {
@@ -137,14 +135,16 @@ impl Downloader {
                 This value will also almost certainly have to be escaped.
 
             1) Reserved bytes: During the "Peer handshake" stage, the handshake message includes eight reserved bytes (64 bits), all set to zero.
-            To signal support for extensions, a client must set the 20th bit from the right (counting starts at 0) in the reserved bytes to 1.
-            In Hex, here's how the reserved bytes will look like after setting the 20th bit from the right to 1:
+               To signal support for extensions, a client must set the 20th bit from the right (counting starts at 0) in the reserved bytes to 1.
+               In Hex, here's how the reserved bytes will look like after setting the 20th bit from the right to 1:
 
-            .... 00010000 00000000 00000000
-                    ^ 20th bit from the right, counting starts at 0
+               .... 00010000 00000000 00000000
+                       ^ 20th bit from the right, counting starts at 0
 
-            00 00 00 00 00 10 00 00
-            (10 in hex is 16 in decimal, which is 00010000 in binary)
+               00 00 00 00 00 10 00 00
+               (10 in hex is 16 in decimal, which is 00010000 in binary)
+
+               https://www.bittorrent.org/beps/bep_0010.html
         */
 
         let handshake_len = 1 + 19 + 8 + 20 + 20;
@@ -156,7 +156,7 @@ impl Downloader {
             // signal support for extensions
             // 00 00 00 00 00 10 00 00
             data.put_bytes(b'\0', 5);
-            data.put_u8(16);
+            data.put_u8(16); // == 0x10
             data.put_bytes(b'\0', 2);
         } else {
             // 8 zero bytes
@@ -187,11 +187,17 @@ impl Downloader {
         let mut remote_peer_id = [0_u8; 20];
         remote_peer_id.copy_from_slice(&resp[handshake_len - 20..]);
 
+        let reserved_bytes = &resp[20..28]; // 8 reserved bytes from response
+        if reserved_bytes[5] & 0x10 == 0x10 {
+            // peer supports extended messaging
+            self.peers_supporting_extensions.insert(remote_peer_id);
+        }
+
         Ok((remote_peer_id, stream))
     }
 
     pub async fn download_piece(
-        &self,
+        &mut self,
         output: impl AsRef<Path>,
         torrent: Torrent,
         piece: usize,
@@ -223,7 +229,7 @@ impl Downloader {
         }
 
         if let Some(stream) = stream {
-            let framer = Framer::new(stream).await?;
+            let framer = Framer::new(stream, false).await?;
             download::download_piece(framer, output, piece, &torrent).await?;
             Ok(())
         } else {
@@ -232,7 +238,7 @@ impl Downloader {
     }
 
     pub async fn download_all(
-        self,
+        mut self,
         output: impl AsRef<Path>,
         torrent: Torrent,
     ) -> anyhow::Result<()> {
@@ -301,7 +307,6 @@ impl Downloader {
         let cloned_torrent = torrent.clone();
 
         // connect to peers
-        //let torrent_path = PathBuf::from(torrent_file.as_ref());
         tokio::spawn(async move {
             let mut connected_peers = 0;
             while let Some(peer) = peer_addrs.recv().await {
@@ -326,8 +331,6 @@ impl Downloader {
             eprintln!("Connecting to {} peers finished", connected_peers);
         });
 
-        // let torrent =
-        //     torrent::parse_torrent(torrent_file.as_ref().into()).context("parsing torrent file")?;
         let pieces_count = torrent.info.hashes.len();
 
         // we need MPMC channel for the task queue
@@ -360,7 +363,7 @@ impl Downloader {
         // every peer connection will take a piece to download from the queue
         eprintln!("Starting download queue");
         while let Some(peer_stream) = peer_streams.recv().await {
-            let mut framer = Framer::new(peer_stream).await?;
+            let mut framer = Framer::new(peer_stream, false).await?;
 
             let tasks = tasks.clone();
             let pieces_tx = pieces_tx.clone();
@@ -462,6 +465,15 @@ impl Downloader {
             encoded.push_str(&hex::encode([byte]));
         }
         encoded
+    }
+
+    /// A string of length 20 which this downloader uses as its id.
+    /// Each downloader generates its own id at random at the start of a new download.
+    /// This value will almost certainly have to be escaped.
+    fn random_peer_id() -> String {
+        std::iter::repeat_with(fastrand::alphanumeric)
+            .take(20)
+            .collect()
     }
 }
 
