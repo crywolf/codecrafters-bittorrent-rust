@@ -451,7 +451,10 @@ impl Downloader {
             tokio::io::copy(&mut piece_file, &mut output_file)
                 .await
                 .with_context(|| {
-                    format!("writing piece data to file {}", output.as_ref().display())
+                    format!(
+                        "writing piece data from file to output file {}",
+                        output.as_ref().display()
+                    )
                 })?;
         }
 

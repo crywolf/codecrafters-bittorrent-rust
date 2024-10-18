@@ -66,7 +66,7 @@ impl Framer {
             eprintln!("Peer supports extensions => sending Extended handshake message");
 
             /// https://www.bittorrent.org/beps/bep_0010.html#handshake-message
-            #[derive(Serialize, Deserialize, Debug)]
+            #[derive(Serialize, Deserialize)]
             struct ExtendedMsgPayload {
                 m: Mdictionary,
             }
@@ -78,7 +78,7 @@ impl Framer {
             ///     ... (other extension names and IDs)
             ///   }
             /// }
-            #[derive(Serialize, Deserialize, Debug)]
+            #[derive(Serialize, Deserialize)]
             struct Mdictionary {
                 pub ut_metadata: u8,
             }
@@ -104,7 +104,7 @@ impl Framer {
                 .context("sending Extended message (extension handshake)")?;
 
             // 2B. Wait until you receive an Extended handshake message back
-            eprintln!("Waiting for Extended message response");
+            eprintln!("Waiting for Extended handhake message response");
             let extended_msg = framer
                 .next()
                 .await
@@ -130,6 +130,36 @@ impl Framer {
                 extended_msg_id
             );
             eprintln!("Got Extended message response");
+
+            eprintln!("Sending Metadata extension message");
+            // 2C. Send the metadata request message {'msg_type': 0, 'piece': 0}
+            // https://www.bittorrent.org/beps/bep_0009.html#extension-message
+            #[derive(Serialize, Deserialize, Debug)]
+            struct MetadataRequest {
+                pub msg_type: u8,
+                pub piece: usize,
+            }
+            let request_msg_type = 0; // request message
+            let metadata_request = MetadataRequest {
+                msg_type: request_msg_type,
+                piece: 0,
+            };
+            let request_payload = serde_bencode::to_bytes(&metadata_request)
+                .context("bencoding metadata request payload")?;
+
+            let mut payload =
+                vec![peer_metadata_extension_id.expect("peer metadata extension id must be set")];
+            payload.extend_from_slice(&request_payload);
+
+            framer
+                .send(Message {
+                    tag: MessageTag::Extended,
+                    payload,
+                })
+                .await
+                .context("sending Extended message (metadata request)")?;
+
+            eprintln!("Metadata extension message sent");
         }
 
         // 3. Send an Interested message

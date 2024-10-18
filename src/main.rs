@@ -49,6 +49,8 @@ enum Command {
     MagnetParse { magnet_link: String },
     /// Establish a TCP connection with a peer and complete a handshake using a magnet link
     MagnetHandshake { magnet_link: String },
+    /// Request torrent metadada using magnet link
+    MagnetInfo { magnet_link: String },
 }
 
 #[tokio::main]
@@ -153,6 +155,35 @@ async fn main() -> anyhow::Result<()> {
             if let Some(peer_extension_id) = framer.peer_metadata_extension_id() {
                 println!("Peer Metadata Extension ID: {}", peer_extension_id);
             }
+
+            Ok(())
+        }
+        Command::MagnetInfo { magnet_link } => {
+            let magnet = torrent::parse_magnet_link(&magnet_link).context("parsing magnet link")?;
+            let torrent = Torrent::from_magnet(magnet);
+
+            let tracker_response = downloader
+                .discover_peers(&torrent)
+                .await
+                .context("discovering peers")?;
+            let &peer_socket = tracker_response
+                .peers
+                .first()
+                .ok_or(anyhow!("Could not find any peer"))?;
+
+            let (remote_peer_id, stream) = downloader.handshake(&torrent, peer_socket).await?;
+
+            let ext_support = downloader.does_peer_support_extensions(&remote_peer_id);
+            let _framer = Framer::new(stream, ext_support).await?;
+
+            // println!("Tracker URL: {}", torrent.announce);
+            // println!("Length: {}", torrent.info.length);
+            // println!("Info Hash: {}", hex::encode(torrent.info.info_hash));
+            // println!("Piece Length: {}", torrent.info.piece_length);
+            // println!("Info Hashes: ");
+            // for hash in torrent.info.hashes.iter() {
+            //     println!("{}", hex::encode(hash));
+            // }
 
             Ok(())
         }

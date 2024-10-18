@@ -166,7 +166,7 @@ pub async fn download_piece(
 
     tokio::fs::write(&output, piece_data)
         .await
-        .with_context(|| format!("writing piece data do file {}", output.as_ref().display()))?;
+        .with_context(|| format!("writing piece data to file {}", output.as_ref().display()))?;
 
     let framer = framer_rx.await?;
 
