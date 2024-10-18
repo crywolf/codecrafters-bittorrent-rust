@@ -14,7 +14,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::piece::Piece;
-use crate::torrent::Torrent;
+use crate::torrent::{Hash, Torrent};
 use framer::Framer;
 
 const MAX_CONNECTED_PEERS: usize = 5;
@@ -73,7 +73,7 @@ impl TrackerRequest {
 pub struct Downloader {
     /// Peer ID of the downloader
     peer_id: String,
-    peers_supporting_extensions: HashSet<[u8; 20]>, // TODO peer id as a type
+    peers_supporting_extensions: HashSet<Hash>,
 }
 
 impl Downloader {
@@ -84,7 +84,7 @@ impl Downloader {
         }
     }
 
-    pub fn does_peer_support_extensions(&self, peer_id: &[u8; 20]) -> bool {
+    pub fn does_peer_support_extensions(&self, peer_id: &Hash) -> bool {
         self.peers_supporting_extensions.contains(peer_id)
     }
 
@@ -118,7 +118,7 @@ impl Downloader {
         &mut self,
         torrent: &Torrent,
         peer_socket: SocketAddrV4,
-    ) -> anyhow::Result<([u8; 20], tokio::net::TcpStream)> {
+    ) -> anyhow::Result<(Hash, tokio::net::TcpStream)> {
         let mut stream = tokio::net::TcpStream::connect(peer_socket)
             .await
             .context("connecting to peer")?;
@@ -184,7 +184,7 @@ impl Downloader {
         anyhow::ensure!(resp[0] == 19);
         anyhow::ensure!(&resp[1..20] == b"BitTorrent protocol");
 
-        let mut remote_peer_id = [0_u8; 20];
+        let mut remote_peer_id = Hash::new();
         remote_peer_id.copy_from_slice(&resp[handshake_len - 20..]);
 
         let reserved_bytes = &resp[20..28]; // 8 reserved bytes from response
