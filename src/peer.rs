@@ -4,17 +4,17 @@ pub mod framer;
 
 use std::collections::{BTreeMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::{atomic, Arc};
 
 use anyhow::Context;
 use bytes::{Buf, BufMut};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::piece::Piece;
-use crate::torrent::{Hash, Torrent};
+use crate::torrent::Torrent;
 use framer::Framer;
 
 const MAX_CONNECTED_PEERS: usize = 5;
@@ -44,7 +44,7 @@ impl Deref for Peers {
 #[derive(Serialize)]
 struct TrackerRequest {
     /// A string of length 20 which this downloader uses as its id
-    peer_id: String,
+    peer_id: PeerId,
     /// The port number this peer is listening on
     port: u16,
     /// The total amount uploaded so far
@@ -58,9 +58,9 @@ struct TrackerRequest {
 }
 
 impl TrackerRequest {
-    fn new(peer_id: &str, left: usize) -> Self {
+    fn new(peer_id: PeerId, left: usize) -> Self {
         Self {
-            peer_id: peer_id.to_string(),
+            peer_id,
             port: 6881,
             uploaded: 0,
             downloaded: 0,
@@ -70,10 +70,59 @@ impl TrackerRequest {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct PeerId([u8; 20]);
+
+impl PeerId {
+    pub fn hex(&self) -> String {
+        hex::encode(self)
+    }
+}
+
+impl Deref for PeerId {
+    type Target = [u8; 20];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for PeerId {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl AsRef<[u8]> for PeerId {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl TryFrom<&[u8]> for PeerId {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        Ok(PeerId(value.try_into()?))
+    }
+}
+
+impl Serialize for PeerId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_newtype_struct(
+            "peer_id",
+            core::str::from_utf8(&self.0).expect("Our Peer Id contains only valid utf-8 chars"),
+        )
+    }
+}
+
 pub struct Downloader {
     /// Peer ID of the downloader
-    peer_id: String,
-    peers_supporting_extensions: HashSet<Hash>,
+    peer_id: PeerId,
+    peers_supporting_extensions: HashSet<PeerId>,
 }
 
 impl Downloader {
@@ -84,12 +133,12 @@ impl Downloader {
         }
     }
 
-    pub fn does_peer_support_extensions(&self, peer_id: &Hash) -> bool {
+    pub fn does_peer_support_extensions(&self, peer_id: &PeerId) -> bool {
         self.peers_supporting_extensions.contains(peer_id)
     }
 
     pub async fn discover_peers(&self, torrent: &Torrent) -> anyhow::Result<TrackerResponse> {
-        let request = TrackerRequest::new(&self.peer_id, torrent.info.length);
+        let request = TrackerRequest::new(self.peer_id, torrent.info.length);
 
         let query =
             serde_urlencoded::to_string(request).context("serializing request query params")?;
@@ -118,7 +167,7 @@ impl Downloader {
         &mut self,
         torrent: &Torrent,
         peer_socket: SocketAddrV4,
-    ) -> anyhow::Result<(Hash, tokio::net::TcpStream)> {
+    ) -> anyhow::Result<(PeerId, tokio::net::TcpStream)> {
         let mut stream = tokio::net::TcpStream::connect(peer_socket)
             .await
             .context("connecting to peer")?;
@@ -165,7 +214,7 @@ impl Downloader {
         }
 
         data.put_slice(torrent.info.info_hash.as_slice());
-        data.put_slice(self.peer_id.as_bytes());
+        data.put_slice(self.peer_id.as_ref());
 
         stream
             .write_all(&data)
@@ -184,8 +233,9 @@ impl Downloader {
         anyhow::ensure!(resp[0] == 19);
         anyhow::ensure!(&resp[1..20] == b"BitTorrent protocol");
 
-        let mut remote_peer_id = Hash::new();
+        let mut remote_peer_id = [0u8; 20];
         remote_peer_id.copy_from_slice(&resp[handshake_len - 20..]);
+        let remote_peer_id = PeerId(remote_peer_id);
 
         let reserved_bytes = &resp[20..28]; // 8 reserved bytes from response
         if reserved_bytes[5] & 0x10 == 0x10 {
@@ -310,7 +360,6 @@ impl Downloader {
         tokio::spawn(async move {
             let mut connected_peers = 0;
             while let Some(peer) = peer_addrs.recv().await {
-                //let torrent = torrent_path.clone();
                 if let Ok((peer_id, stream)) =
                     self.handshake(&cloned_torrent, peer).await.map_err(|err| {
                         eprintln!(
@@ -318,7 +367,7 @@ impl Downloader {
                         )
                     })
                 {
-                    eprintln!("Connected to peer {}", hex::encode(peer_id));
+                    eprintln!("Connected to peer {}", peer_id.hex());
                     connected_peers += 1;
                     peer_streams_tx
                         .send(stream)
@@ -464,10 +513,11 @@ impl Downloader {
     /// A string of length 20 which this downloader uses as its id.
     /// Each downloader generates its own id at random at the start of a new download.
     /// This value will almost certainly have to be escaped.
-    fn random_peer_id() -> String {
-        std::iter::repeat_with(fastrand::alphanumeric)
+    fn random_peer_id() -> PeerId {
+        let s: String = std::iter::repeat_with(fastrand::alphanumeric)
             .take(20)
-            .collect()
+            .collect();
+        s.as_bytes().try_into().expect("guaranteed to be length 20")
     }
 }
 

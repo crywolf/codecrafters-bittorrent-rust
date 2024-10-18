@@ -94,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
                 .context("parsing peer address")?;
 
             let (remote_peer_id, _) = downloader.handshake(&torrent, peer_socket).await?;
-            println!("Peer ID: {}", hex::encode(remote_peer_id));
+            println!("Peer ID: {}", remote_peer_id.hex());
             Ok(())
         }
         Command::DownloadPiece {
@@ -151,7 +151,7 @@ async fn main() -> anyhow::Result<()> {
             let ext_support = downloader.does_peer_support_extensions(&remote_peer_id);
             let framer = Framer::new(stream, ext_support).await?;
 
-            println!("Peer ID: {}", hex::encode(remote_peer_id));
+            println!("Peer ID: {}", remote_peer_id.hex());
             if let Some(peer_extension_id) = framer.peer_metadata_extension_id() {
                 println!("Peer Metadata Extension ID: {}", peer_extension_id);
             }
