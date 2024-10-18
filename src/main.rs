@@ -72,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Piece Length: {}", torrent.info.piece_length);
             println!("Info Hashes: ");
             for hash in torrent.info.hashes.iter() {
-                println!("{}", hex::encode(hash));
+                println!("{}", hash.hex());
             }
             Ok(())
         }
@@ -182,7 +182,7 @@ async fn main() -> anyhow::Result<()> {
             // println!("Piece Length: {}", torrent.info.piece_length);
             // println!("Info Hashes: ");
             // for hash in torrent.info.hashes.iter() {
-            //     println!("{}", hex::encode(hash));
+            //     println!("{}", hash.hex());
             // }
 
             Ok(())

@@ -123,11 +123,19 @@ impl AsRef<[u8]> for Hash {
     }
 }
 
+impl TryFrom<&[u8]> for Hash {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        Ok(Hash(value.try_into()?))
+    }
+}
+
 #[derive(Clone, Default, Debug)]
-pub struct Hashes(Vec<[u8; 20]>);
+pub struct Hashes(Vec<Hash>);
 
 impl Deref for Hashes {
-    type Target = Vec<[u8; 20]>;
+    type Target = Vec<Hash>;
 
     fn deref(&self) -> &Self::Target {
         &self.0

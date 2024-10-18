@@ -160,7 +160,7 @@ pub async fn download_piece(
     let computed_hash = sha1::Sha1::digest(&piece_data);
 
     anyhow::ensure!(
-        expected_hash == computed_hash.as_slice(),
+        expected_hash.as_slice() == computed_hash.as_slice(),
         "piece hash of downloaded data does not match the hash from the torrent file"
     );
 
