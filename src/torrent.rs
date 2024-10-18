@@ -1,7 +1,12 @@
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 use sha1::Digest;
-use std::{borrow::Cow, fs, ops::Deref, path::PathBuf};
+use std::{
+    borrow::Cow,
+    fs,
+    ops::{Deref, DerefMut},
+    path::PathBuf,
+};
 
 /// Metainfo files (also known as .torrent files) are bencoded dictionaries
 /// https://www.bittorrent.org/beps/bep_0003.html#metainfo-files
@@ -46,7 +51,7 @@ pub struct Info {
 
     /// SHA-1 hash of this bencoded Info dictionary
     #[serde(skip)]
-    pub info_hash: [u8; 20],
+    pub info_hash: Hash,
 }
 
 impl Torrent {
@@ -71,8 +76,50 @@ impl Info {
             piece_length: 0,
             pieces: Vec::new(),
             hashes: Hashes::default(),
-            info_hash: [0u8; 20],
+            info_hash: Hash::default(),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Hash([u8; 20]);
+
+impl Hash {
+    pub fn new() -> Self {
+        Hash::default()
+    }
+
+    pub fn hex(&self) -> String {
+        hex::encode(self)
+    }
+
+    pub fn urlencode(&self) -> String {
+        let mut encoded = String::with_capacity(3 * self.0.len());
+        for byte in self.0 {
+            encoded.push('%');
+            encoded.push_str(&hex::encode([byte]));
+        }
+        encoded
+    }
+}
+
+impl Deref for Hash {
+    type Target = [u8; 20];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Hash {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl AsRef<[u8]> for Hash {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -114,7 +161,7 @@ pub fn parse_torrent(file: PathBuf) -> anyhow::Result<Torrent> {
     );
 
     torrent.info.hashes = hashes;
-    torrent.info.info_hash = digest.into();
+    *torrent.info.info_hash = digest.into();
 
     Ok(torrent)
 }
@@ -124,7 +171,7 @@ pub fn parse_torrent(file: PathBuf) -> anyhow::Result<Torrent> {
 /// https://en.wikipedia.org/wiki/Magnet_URI_scheme
 pub struct Magnet {
     /// SHA-1 hash of bencoded `Info` dictionary (required)
-    pub info_hash: [u8; 20],
+    pub info_hash: Hash,
     /// The URL of the tracker. A magnet link can contain multiple tracker URLs, but for the purposes of this challenge it'll only contain one.
     pub announce: Option<String>,
     #[allow(dead_code)]
@@ -135,7 +182,7 @@ pub struct Magnet {
 pub fn parse_magnet_link(magnet_link: &str) -> anyhow::Result<Magnet> {
     let mut announce = None;
     let mut name = None;
-    let mut info_hash = [0u8; 20];
+    let mut info_hash = Hash::new();
 
     let url = reqwest::Url::parse(magnet_link)?;
     for (k, v) in url.query_pairs() {
@@ -147,7 +194,8 @@ pub fn parse_magnet_link(magnet_link: &str) -> anyhow::Result<Magnet> {
                 let ih = ih
                     .strip_prefix("urn:btih:")
                     .ok_or(anyhow!("malformed magnet link").context("parsing xt param"))?;
-                hex::decode_to_slice(ih, &mut info_hash).context("decode xt from hex to bytes")?;
+                hex::decode_to_slice(ih, info_hash.as_mut())
+                    .context("decode xt from hex to bytes")?;
             }
             _ => anyhow::bail!("invalid magnet link: unknown '{}' param", k),
         }
@@ -177,7 +225,7 @@ mod tests {
         );
         assert_eq!(r.name, Some("sample.torrent".to_string()));
         assert_eq!(
-            hex::encode(r.info_hash),
+            r.info_hash.hex(),
             "d69f91e6b2ae4c542468d1073a71d4ea13879a7f"
         );
     }

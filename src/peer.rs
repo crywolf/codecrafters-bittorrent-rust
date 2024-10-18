@@ -98,7 +98,7 @@ impl Downloader {
             "{}?{}&info_hash={}",
             torrent.announce,
             query,
-            Self::urlencode(&info_hash)
+            info_hash.urlencode()
         );
 
         // GET /announce?peer_id=aaaaaaaaaaaaaaaaaaaa&info_hash=aaaaaaaaaaaaaaaaaaaa&port=6881&left=0&downloaded=100&uploaded=0&compact=1
@@ -164,7 +164,7 @@ impl Downloader {
             data.put_bytes(b'\0', 8);
         }
 
-        data.put_slice(&torrent.info.info_hash);
+        data.put_slice(torrent.info.info_hash.as_slice());
         data.put_slice(self.peer_id.as_bytes());
 
         stream
@@ -459,15 +459,6 @@ impl Downloader {
         }
 
         Ok(())
-    }
-
-    fn urlencode(t: &[u8; 20]) -> String {
-        let mut encoded = String::with_capacity(3 * t.len());
-        for &byte in t {
-            encoded.push('%');
-            encoded.push_str(&hex::encode([byte]));
-        }
-        encoded
     }
 
     /// A string of length 20 which this downloader uses as its id.

@@ -68,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
             let torrent = torrent::parse_torrent(file).context("parsing torrent file")?;
             println!("Tracker URL: {}", torrent.announce);
             println!("Length: {}", torrent.info.length);
-            println!("Info Hash: {}", hex::encode(torrent.info.info_hash));
+            println!("Info Hash: {}", torrent.info.info_hash.hex());
             println!("Piece Length: {}", torrent.info.piece_length);
             println!("Info Hashes: ");
             for hash in torrent.info.hashes.iter() {
@@ -129,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
                     .announce
                     .ok_or(anyhow!("Missing tracker URL in magnet link"))?
             );
-            println!("Info Hash: {}", hex::encode(magnet.info_hash));
+            println!("Info Hash: {}", magnet.info_hash.hex());
 
             Ok(())
         }
@@ -178,7 +178,7 @@ async fn main() -> anyhow::Result<()> {
 
             // println!("Tracker URL: {}", torrent.announce);
             // println!("Length: {}", torrent.info.length);
-            // println!("Info Hash: {}", hex::encode(torrent.info.info_hash));
+            // println!("Info Hash: {}", torrent.info.info_hash.hex());
             // println!("Piece Length: {}", torrent.info.piece_length);
             // println!("Info Hashes: ");
             // for hash in torrent.info.hashes.iter() {
