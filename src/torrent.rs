@@ -55,7 +55,7 @@ pub struct Info {
 }
 
 impl Torrent {
-    pub fn from_magnet(magnet: Magnet) -> Self {
+    pub fn from_magnet_info(magnet: MagnetInfo) -> Self {
         let mut info = Info::new();
         info.info_hash = magnet.info_hash;
         info.length = 999; // workaround: cannot be zero, but we do not know the file length
@@ -78,6 +78,30 @@ impl Info {
             hashes: Hashes::default(),
             info_hash: Hash::default(),
         }
+    }
+
+    /// Computes info_hash and polulates the list of hashes of the pieces
+    pub fn finalize(&mut self) -> anyhow::Result<()> {
+        let info_bencoded = serde_bencode::to_bytes(&self).context("bencoding Info dictionary")?;
+
+        let digest = sha1::Sha1::digest(info_bencoded);
+        *self.info_hash = digest.into();
+
+        if self.pieces.len() % 20 != 0 {
+            anyhow::bail!(
+                "pieces' lenght must be multiple of 20, but is {}",
+                self.pieces.len()
+            );
+        }
+        let hashes = Hashes(
+            self.pieces
+                .chunks_exact(20)
+                .map(|slice_20| slice_20.try_into().expect("guaranteed to be length 20"))
+                .collect(),
+        );
+
+        self.hashes = hashes;
+        Ok(())
     }
 }
 
@@ -148,28 +172,7 @@ pub fn parse_torrent(file: PathBuf) -> anyhow::Result<Torrent> {
     let mut torrent: Torrent =
         serde_bencode::from_bytes(&bytes).context("deserializing torrent data")?;
 
-    let info_bencoded =
-        serde_bencode::to_bytes(&torrent.info).context("bencoding Info dictionary")?;
-
-    let digest = sha1::Sha1::digest(info_bencoded);
-
-    if torrent.info.pieces.len() % 20 != 0 {
-        anyhow::bail!(
-            "pieces' lenght must be multiple of 20, but is {}",
-            torrent.info.pieces.len()
-        );
-    }
-    let hashes = Hashes(
-        torrent
-            .info
-            .pieces
-            .chunks_exact(20)
-            .map(|slice_20| slice_20.try_into().expect("guaranteed to be length 20"))
-            .collect(),
-    );
-
-    torrent.info.hashes = hashes;
-    *torrent.info.info_hash = digest.into();
+    torrent.info.finalize().context("finalize torrent info")?;
 
     Ok(torrent)
 }
@@ -177,7 +180,7 @@ pub fn parse_torrent(file: PathBuf) -> anyhow::Result<Torrent> {
 /// Magnet links allow users to download files from peers without needing a torrent file.
 /// https://www.bittorrent.org/beps/bep_0009.html
 /// https://en.wikipedia.org/wiki/Magnet_URI_scheme
-pub struct Magnet {
+pub struct MagnetInfo {
     /// SHA-1 hash of bencoded `Info` dictionary (required)
     pub info_hash: Hash,
     /// The URL of the tracker. A magnet link can contain multiple tracker URLs, but for the purposes of this challenge it'll only contain one.
@@ -187,7 +190,7 @@ pub struct Magnet {
     pub name: Option<String>,
 }
 
-pub fn parse_magnet_link(magnet_link: &str) -> anyhow::Result<Magnet> {
+pub fn parse_magnet_link(magnet_link: &str) -> anyhow::Result<MagnetInfo> {
     let mut announce = None;
     let mut name = None;
     let mut info_hash = Hash::new();
@@ -209,7 +212,7 @@ pub fn parse_magnet_link(magnet_link: &str) -> anyhow::Result<Magnet> {
         }
     }
 
-    let magnet = Magnet {
+    let magnet = MagnetInfo {
         announce,
         info_hash,
         name,

@@ -130,12 +130,11 @@ async fn main() -> anyhow::Result<()> {
                     .ok_or(anyhow!("Missing tracker URL in magnet link"))?
             );
             println!("Info Hash: {}", magnet.info_hash.hex());
-
             Ok(())
         }
         Command::MagnetHandshake { magnet_link } => {
             let magnet = torrent::parse_magnet_link(&magnet_link).context("parsing magnet link")?;
-            let torrent = Torrent::from_magnet(magnet);
+            let torrent = Torrent::from_magnet_info(magnet);
 
             let tracker_response = downloader
                 .discover_peers(&torrent)
@@ -160,7 +159,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::MagnetInfo { magnet_link } => {
             let magnet = torrent::parse_magnet_link(&magnet_link).context("parsing magnet link")?;
-            let torrent = Torrent::from_magnet(magnet);
+            let magnet_info_hash = magnet.info_hash;
+
+            let mut torrent = Torrent::from_magnet_info(magnet);
 
             let tracker_response = downloader
                 .discover_peers(&torrent)
@@ -174,16 +175,33 @@ async fn main() -> anyhow::Result<()> {
             let (remote_peer_id, stream) = downloader.handshake(&torrent, peer_socket).await?;
 
             let ext_support = downloader.does_peer_support_extensions(&remote_peer_id);
-            let _framer = Framer::new(stream, ext_support).await?;
+            let mut framer = Framer::new(stream, ext_support).await?;
 
-            // println!("Tracker URL: {}", torrent.announce);
-            // println!("Length: {}", torrent.info.length);
-            // println!("Info Hash: {}", torrent.info.info_hash.hex());
-            // println!("Piece Length: {}", torrent.info.piece_length);
-            // println!("Info Hashes: ");
-            // for hash in torrent.info.hashes.iter() {
-            //     println!("{}", hash.hex());
-            // }
+            let magnet_torrent_info = framer
+                .magnet_torrent_info()
+                .await
+                .context("get magnet torrent info")?
+                .ok_or(anyhow::anyhow!(
+                    "magnet torrent info is missing, does peer supoort magnet extension?"
+                ))?;
+
+            torrent.info = magnet_torrent_info;
+
+            println!("Tracker URL: {}", torrent.announce);
+            println!("Length: {}", torrent.info.length);
+            println!("Info Hash: {}", torrent.info.info_hash.hex());
+            println!("Piece Length: {}", torrent.info.piece_length);
+            println!("Info Hashes: ");
+            for hash in torrent.info.hashes.iter() {
+                println!("{}", hash.hex());
+            }
+
+            anyhow::ensure!(
+                magnet_info_hash == torrent.info.info_hash,
+                "Info Hash mismatch: expected {}, got {}",
+                magnet_info_hash.hex(),
+                torrent.info.info_hash.hex()
+            );
 
             Ok(())
         }

@@ -8,6 +8,7 @@ use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
 use super::codec::MessageCodec;
+use crate::torrent::Info as TorrentInfo;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, IntoPrimitive, TryFromPrimitive)]
 #[repr(u8)]
@@ -30,12 +31,24 @@ pub struct Message {
     pub payload: Vec<u8>,
 }
 
+/// https://www.bittorrent.org/beps/bep_0009.html#extension-message
+#[derive(Serialize, Deserialize, IntoPrimitive, TryFromPrimitive, Debug)]
+#[repr(u8)]
+enum ExtendedMessageType {
+    Request = 0,
+    Data = 1,
+    Reject = 2,
+}
+
 const METADATA_EXTENSION_ID: u8 = 2; // arbitrary number
 
 /// Message codec
-/// It also remembers the metadata extension id for a connected peer
 #[derive(Debug)]
-pub struct Framer(Framed<TcpStream, MessageCodec>, Option<u8>);
+pub struct Framer(
+    Framed<TcpStream, MessageCodec>,
+    Option<u8>,          // peer_metadata_extension_id
+    Option<TorrentInfo>, // torrent info from magnet metadata extension
+);
 
 impl Framer {
     pub async fn new(peer_stream: TcpStream, support_extensions: bool) -> anyhow::Result<Self> {
@@ -44,7 +57,7 @@ impl Framer {
         // 1. Send the bitfield message (safe to ignore in this challenge)
 
         // 2. Wait for a Bitfield message from the peer indicating which pieces it has
-        //    Ignore the payload for now, the tracker used for this challenge ensures that all peers have all pieces available
+        //    Ignore the payload, the tracker used for this challenge ensures that all peers have all pieces available
         eprintln!("Waiting for Bitfield message");
         let bitfield_msg = framer
             .next()
@@ -57,10 +70,11 @@ impl Framer {
             "Expected Bitfield message, got {:?}",
             bitfield_msg.tag
         );
-        eprintln!("Got Bitfield message");
+        eprintln!("Received Bitfield message");
 
         // Extension IDs need to be stored for every peer, as different peers may use different IDs for the same extension.
-        let mut peer_metadata_extension_id = None;
+        let mut stored_peer_metadata_extension_id = None;
+
         if support_extensions {
             // https://www.bittorrent.org/beps/bep_0010.html
             eprintln!("Peer supports extensions => sending Extended handshake message");
@@ -109,7 +123,7 @@ impl Framer {
                 .next()
                 .await
                 .expect("expecting Extended message")
-                .context("decoding Extended message")?;
+                .context("decoding Extended message handshake")?;
 
             anyhow::ensure!(
                 extended_msg.tag == MessageTag::Extended,
@@ -118,80 +132,119 @@ impl Framer {
             );
 
             let extended_msg_id = extended_msg.payload[0];
-            let ext_payload: ExtendedMsgPayload =
-                serde_bencode::from_bytes(&extended_msg.payload[1..])
-                    .context("deserializing Extended msg payload")?;
-
-            peer_metadata_extension_id = Some(ext_payload.m.ut_metadata);
-
             anyhow::ensure!(
                 extended_msg_id == handshake_extended_msg_id,
                 "Expected hanshake extended message ID should be 0, got {}",
                 extended_msg_id
             );
-            eprintln!("Got Extended message response");
 
-            eprintln!("Sending Metadata extension message");
-            // 2C. Send the metadata request message {'msg_type': 0, 'piece': 0}
-            // https://www.bittorrent.org/beps/bep_0009.html#extension-message
-            #[derive(Serialize, Deserialize, Debug)]
-            struct MetadataRequest {
-                pub msg_type: u8,
-                pub piece: usize,
-            }
-            let request_msg_type = 0; // request message
-            let metadata_request = MetadataRequest {
-                msg_type: request_msg_type,
-                piece: 0,
-            };
-            let request_payload = serde_bencode::to_bytes(&metadata_request)
-                .context("bencoding metadata request payload")?;
+            let ext_payload: ExtendedMsgPayload =
+                serde_bencode::from_bytes(&extended_msg.payload[1..])
+                    .context("deserializing Extended msg payload")?;
 
-            let mut payload =
-                vec![peer_metadata_extension_id.expect("peer metadata extension id must be set")];
-            payload.extend_from_slice(&request_payload);
-
-            framer
-                .send(Message {
-                    tag: MessageTag::Extended,
-                    payload,
-                })
-                .await
-                .context("sending Extended message (metadata request)")?;
-
-            eprintln!("Metadata extension message sent");
+            let peer_metadata_extension_id = ext_payload.m.ut_metadata;
+            stored_peer_metadata_extension_id = Some(peer_metadata_extension_id);
+            eprintln!(
+                "Received Extended handshake message response (Peer Metadata Extension ID: {})",
+                peer_metadata_extension_id
+            );
         }
 
-        // 3. Send an Interested message
-        eprintln!("Sending Interested message");
-        framer
-            .send(Message {
-                tag: MessageTag::Interested,
-                payload: Vec::new(),
-            })
+        Ok(Self(framer, stored_peer_metadata_extension_id, None))
+    }
+
+    pub async fn magnet_torrent_info(&mut self) -> anyhow::Result<Option<TorrentInfo>> {
+        if self.1.is_none() {
+            anyhow::bail!("Peer does not support metadata extensions")
+        }
+        if self.2.is_some() {
+            return Ok(self.2.clone());
+        }
+
+        eprintln!("Sending Metadata extension Request message");
+        // 2C. Send the metadata request message
+        //     bencoded dictionary: {'msg_type': 0, 'piece': 0}
+        //      msg_type will be 0 since this is a request message
+        //      piece is the zero-based piece index of the metadata being requested
+        //         (since we're only requesting one piece in this challenge, this will always be 0)
+        // https://www.bittorrent.org/beps/bep_0009.html#extension-message
+        #[derive(Serialize)]
+        struct MetadataRequest {
+            pub msg_type: u8,
+            pub piece: usize,
+        }
+        let metadata_request = MetadataRequest {
+            msg_type: ExtendedMessageType::Request.into(), // request message
+            piece: 0,
+        };
+        let request_payload = serde_bencode::to_bytes(&metadata_request)
+            .context("bencoding metadata request payload")?;
+
+        let mut payload = vec![self
+            .peer_metadata_extension_id()
+            .expect("peer_metadata_extension_id was already set in constructor")];
+        payload.extend_from_slice(&request_payload);
+
+        self.send(Message {
+            tag: MessageTag::Extended,
+            payload,
+        })
+        .await
+        .context("sending Extended message (metadata request)")?;
+        eprintln!("Metadata extension Request message sent");
+
+        eprintln!("Waiting for Metadata extension Data message");
+        // 2D. Wait for the metadata message
+        //     bencoded dictionary: {'msg_type': 1, 'piece': 0, 'total_size': 3425}
+        //      msg_type will be 1, since this is a data message
+        //      piece will be 0, since we're only requesting one piece in this challenge
+        //      total_size will be the length of the metadata piece
+        //
+        // d8:msg_typei1e5:piecei0e10:total_sizei34256eexxxxxxxx...
+        // The x represents binary data (the metadata).
+
+        #[derive(Deserialize, Debug)]
+        #[allow(dead_code)]
+        struct MetadataResponse {
+            pub msg_type: u8,
+            pub piece: usize,
+            pub total_size: usize,
+        }
+
+        let extended_msg = self
+            .next()
             .await
-            .context("sending Interested message")?;
+            .expect("expecting Extended message (metadata response)")
+            .context("decoding Extended message")?;
 
-        /*
-        *** Disabled because of codecrafters tests (some of them do not send Unchoke messages) ***
+        anyhow::ensure!(
+            extended_msg.tag == MessageTag::Extended,
+            "Expected Extended Metadata message, got {:?}",
+            extended_msg.tag
+        );
 
-               // 4. Wait until you receive an Unchoke message back
-               eprintln!("Waiting for Unchoke message");
-               let unchoke_msg = framer
-                   .next()
-                   .await
-                   .expect("expecting Unchoke message")
-                   .context("decoding Unchoke message")?;
+        let extended_msg_id = extended_msg.payload[0];
+        anyhow::ensure!(
+            extended_msg_id == METADATA_EXTENSION_ID,
+            "Expected extended message ID (metadata response) should be {}, got {}",
+            METADATA_EXTENSION_ID,
+            extended_msg_id
+        );
+        let response: MetadataResponse = serde_bencode::from_bytes(&extended_msg.payload[1..])
+            .context("deserializing Extended msg payload")?;
 
-               anyhow::ensure!(
-                   unchoke_msg.tag == MessageTag::Unchoke,
-                   "Expected Unchoke message, got {:?}",
-                   unchoke_msg.tag
-               );
-               eprintln!("Got Unchoke message");
-        */
+        let mut torrent_info: TorrentInfo = serde_bencode::from_bytes(
+            &extended_msg.payload[extended_msg.payload.len() - response.total_size..],
+        )
+        .context("deserializing Extended Metadata msg payload")?;
 
-        Ok(Self(framer, peer_metadata_extension_id))
+        torrent_info
+            .finalize()
+            .context("finalize deserialized torrent info")?;
+
+        self.2 = Some(torrent_info);
+
+        Ok(self.2.clone())
     }
 
     pub fn peer_metadata_extension_id(&self) -> Option<u8> {

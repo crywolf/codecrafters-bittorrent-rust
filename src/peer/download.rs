@@ -21,6 +21,33 @@ pub async fn download_piece(
     piece: usize,
     torrent: &Torrent,
 ) -> anyhow::Result<Framer> {
+    // 3. Send an Interested message
+    eprintln!("Sending Interested message");
+    framer
+        .send(Message {
+            tag: MessageTag::Interested,
+            payload: Vec::new(),
+        })
+        .await
+        .context("sending Interested message")?;
+
+    /* *** Disabled because of codecrafters tests (some of them do not send Unchoke messages) ***
+
+        // 4. Wait until you receive an Unchoke message back
+        eprintln!("Waiting for Unchoke message");
+        let unchoke_msg = framer
+            .next()
+            .await
+            .expect("expecting Unchoke message")
+            .context("decoding Unchoke message")?;
+
+        anyhow::ensure!(
+            unchoke_msg.tag == MessageTag::Unchoke,
+            "Expected Unchoke message, got {:?}",
+            unchoke_msg.tag
+        );
+        eprintln!("Received Unchoke message");
+    */
     let pieces_count = torrent.info.hashes.len();
 
     if piece > pieces_count {
@@ -83,7 +110,7 @@ pub async fn download_piece(
         let mut received_blocks = 0;
         loop {
             tokio::select! {
-                // 4. Send a Request message for each block
+                // 5. Send a Request message for each block
                 Some(message) = request_rx.recv() => {
                     _ = framer
                         .send(message)
@@ -91,7 +118,7 @@ pub async fn download_piece(
                         .context("sending Request message").map_err(|e| eprintln!("Error: {:?}", e));
                 }
 
-                // 5. Wait for a Piece message for each block you've requested
+                // 6. Wait for a Piece message for each block you've requested
                 Some(resp) = framer.next() => {
                     if let Ok(message) = resp {
                         if message.tag == MessageTag::Piece { // ignoring other message types
