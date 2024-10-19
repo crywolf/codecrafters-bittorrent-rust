@@ -51,6 +51,15 @@ enum Command {
     MagnetHandshake { magnet_link: String },
     /// Request torrent metadada using magnet link
     MagnetInfo { magnet_link: String },
+    MagnetDownloadPiece {
+        /// Output file
+        #[arg(short)]
+        output: PathBuf,
+        /// Magnet link
+        magnet_link: String,
+        /// Piece number
+        piece: usize,
+    },
 }
 
 #[tokio::main]
@@ -202,6 +211,19 @@ async fn main() -> anyhow::Result<()> {
                 magnet_info_hash.hex(),
                 torrent.info.info_hash.hex()
             );
+
+            Ok(())
+        }
+        Command::MagnetDownloadPiece {
+            output,
+            magnet_link,
+            piece,
+        } => {
+            let magnet = torrent::parse_magnet_link(&magnet_link).context("parsing magnet link")?;
+            let torrent = Torrent::from_magnet_info(magnet);
+
+            downloader.download_piece(&output, torrent, piece).await?;
+            println!("Piece {} downloaded to {}.", piece, output.display());
 
             Ok(())
         }

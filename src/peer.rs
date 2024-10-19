@@ -249,7 +249,7 @@ impl Downloader {
     pub async fn download_piece(
         &mut self,
         output: impl AsRef<Path>,
-        torrent: Torrent,
+        mut torrent: Torrent,
         piece: usize,
     ) -> anyhow::Result<()> {
         let peers = self
@@ -263,23 +263,36 @@ impl Downloader {
         }
 
         let mut stream: Option<tokio::net::TcpStream> = None;
+        let mut peer_id: Option<PeerId> = None;
         for &peer in peers.iter() {
-            stream = match self.handshake(&torrent, peer).await {
-                Ok((_, s)) => Some(s),
+            (peer_id, stream) = match self.handshake(&torrent, peer).await {
+                Ok((peer_id, stream)) => (Some(peer_id), Some(stream)),
                 Err(err) => {
                     eprintln!("Performing hanshake with peer {peer} failed with error: {err:?}");
-                    None
+                    (None, None)
                 }
             };
 
-            if stream.is_some() {
+            if peer_id.is_some() {
                 eprintln!("Succesfull handhake with peer: {peer}");
                 break;
             }
         }
 
-        if let Some(stream) = stream {
-            let framer = Framer::new(stream, false).await?;
+        if let (Some(peer_id), Some(stream)) = (peer_id, stream) {
+            let ext_support = self.does_peer_support_extensions(&peer_id);
+            let mut framer = Framer::new(stream, ext_support).await?;
+            if ext_support {
+                let magnet_torrent_info = framer
+                    .magnet_torrent_info()
+                    .await
+                    .context("get magnet torrent info")?
+                    .ok_or(anyhow::anyhow!(
+                        "magnet torrent info is missing, does peer supoort magnet extension?"
+                    ))?;
+
+                torrent.info = magnet_torrent_info;
+            }
             download::download_piece(framer, output, piece, &torrent).await?;
             Ok(())
         } else {

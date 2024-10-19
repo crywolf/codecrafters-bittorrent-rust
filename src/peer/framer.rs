@@ -230,6 +230,9 @@ impl Framer {
             METADATA_EXTENSION_ID,
             extended_msg_id
         );
+
+        eprintln!("Received Metadata extension Data message");
+
         let response: MetadataResponse = serde_bencode::from_bytes(&extended_msg.payload[1..])
             .context("deserializing Extended msg payload")?;
 
