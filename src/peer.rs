@@ -14,6 +14,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::piece::Piece;
+use crate::torrent::Info as TorrentInfo;
 use crate::torrent::Torrent;
 use framer::Framer;
 
@@ -201,7 +202,7 @@ impl Downloader {
         data.put_u8(19);
         data.put_slice(b"BitTorrent protocol");
 
-        if torrent.from_magnet_link {
+        if torrent.is_from_magnet_link {
             // signal support for extensions
             // 00 00 00 00 00 10 00 00
             data.put_bytes(b'\0', 5);
@@ -303,7 +304,7 @@ impl Downloader {
     pub async fn download_all(
         mut self,
         output: impl AsRef<Path>,
-        torrent: Torrent,
+        mut torrent: Torrent,
     ) -> anyhow::Result<()> {
         let available_peers = self
             .discover_peers(&torrent)
@@ -318,7 +319,7 @@ impl Downloader {
         let (peer_addrs_tx, mut peer_addrs) =
             tokio::sync::mpsc::channel::<SocketAddrV4>(MAX_CONNECTED_PEERS);
         let (peer_streams_tx, mut peer_streams) =
-            tokio::sync::mpsc::channel::<tokio::net::TcpStream>(MAX_CONNECTED_PEERS);
+            tokio::sync::mpsc::channel::<Framer>(MAX_CONNECTED_PEERS);
         let (add_peer_tx, mut add_peer_rx) = tokio::sync::mpsc::channel::<()>(1);
         let (finished, mut done) = tokio::sync::mpsc::channel::<()>(1);
 
@@ -367,23 +368,59 @@ impl Downloader {
             eprintln!("Adding new peers loop finished");
         });
 
-        let cloned_torrent = torrent.clone();
+        let (torrent_info_tx, mut torrent_info_rx) = tokio::sync::mpsc::channel::<TorrentInfo>(1);
 
         // connect to peers
+        let cloned_torrent = torrent.clone();
         tokio::spawn(async move {
             let mut connected_peers = 0;
             while let Some(peer) = peer_addrs.recv().await {
                 if let Ok((peer_id, stream)) =
                     self.handshake(&cloned_torrent, peer).await.map_err(|err| {
-                        eprintln!(
-                            "Performing hanshake with peer {peer} failed with error:\n{err:?}"
-                        )
+                        eprintln!("Handshake with peer {peer} failed with error:\n{err:?}")
                     })
                 {
                     eprintln!("Connected to peer {}", peer_id.hex());
                     connected_peers += 1;
+
+                    let ext_support = self.does_peer_support_extensions(&peer_id);
+                    let mut framer = Framer::new(stream, ext_support)
+                        .await
+                        .map_err(|err| {
+                            eprintln!(
+                                "Failed to create framer for peer {}:\n{err:?}",
+                                peer_id.hex()
+                            )
+                        })
+                        .expect("Framer needs to be created");
+
+                    if ext_support && !torrent_info_tx.is_closed() {
+                        eprintln!(
+                            "> Asking for magnet torrent info from peer {}",
+                            peer_id.hex()
+                        );
+
+                        let magnet_torrent_info = framer
+                            .magnet_torrent_info()
+                            .await
+                            .map_err(|err| {
+                                eprintln!(
+                                    "Failed to get magnet torrent info from peer {}:\n{err:?}",
+                                    peer_id.hex()
+                                )
+                            })
+                            .expect("get magnet torrent info")
+                            .expect("magnet torrent info shoulb be present");
+
+                        eprintln!("> Magnet torrent info received");
+                        torrent_info_tx
+                            .send(magnet_torrent_info)
+                            .await
+                            .expect("torrent_info channel should not be closed");
+                    }
+
                     peer_streams_tx
-                        .send(stream)
+                        .send(framer)
                         .await
                         .expect("peer streams channel should not not be closed");
                 }
@@ -392,6 +429,20 @@ impl Downloader {
 
             eprintln!("Connecting to {} peers finished", connected_peers);
         });
+
+        if torrent.is_from_magnet_link {
+            eprintln!("> Waiting for magnet torrent info");
+            if let Some(magnet_torrent_info) = torrent_info_rx.recv().await {
+                anyhow::ensure!(
+                    torrent.info.info_hash == magnet_torrent_info.info_hash,
+                    "torrent info hash mismatch"
+                );
+                eprintln!("> Magnet torrent info hash verified");
+                torrent.info = magnet_torrent_info;
+
+                drop(torrent_info_rx);
+            }
+        }
 
         let pieces_count = torrent.info.hashes.len();
 
@@ -424,9 +475,7 @@ impl Downloader {
 
         // every peer connection will take a piece to download from the queue
         eprintln!("Starting download queue");
-        while let Some(peer_stream) = peer_streams.recv().await {
-            let mut framer = Framer::new(peer_stream, false).await?;
-
+        while let Some(mut framer) = peer_streams.recv().await {
             let tasks = tasks.clone();
             let pieces_tx = pieces_tx.clone();
             let errored_pieces = errored_pieces.clone();

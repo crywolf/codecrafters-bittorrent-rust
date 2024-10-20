@@ -21,7 +21,7 @@ pub struct Torrent {
 
     /// Torrent was obtainded from magnet link
     #[serde(skip)]
-    pub from_magnet_link: bool,
+    pub is_from_magnet_link: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug)]
@@ -59,11 +59,12 @@ impl Torrent {
         let mut info = Info::new();
         info.info_hash = magnet.info_hash;
         info.length = 999; // workaround: cannot be zero, but we do not know the file length
+        info.name = magnet.name.unwrap_or_default();
 
         Self {
             announce: magnet.announce.unwrap(),
             info,
-            from_magnet_link: true,
+            is_from_magnet_link: true,
         }
     }
 }
@@ -80,7 +81,7 @@ impl Info {
         }
     }
 
-    /// Computes info_hash and polulates the list of hashes of the pieces
+    /// Computes info_hash and populates the list of hashes of the pieces
     pub fn finalize(&mut self) -> anyhow::Result<()> {
         let info_bencoded = serde_bencode::to_bytes(&self).context("bencoding Info dictionary")?;
 
@@ -185,7 +186,6 @@ pub struct MagnetInfo {
     pub info_hash: Hash,
     /// The URL of the tracker. A magnet link can contain multiple tracker URLs, but for the purposes of this challenge it'll only contain one.
     pub announce: Option<String>,
-    #[allow(dead_code)]
     /// Suggested name to save the file / directory as
     pub name: Option<String>,
 }
